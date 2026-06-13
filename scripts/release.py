@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """Cut a new chime release.
 
+The package version is derived from the git tag at build time (hatch-vcs),
+so this script doesn't touch __init__.py — it only edits CHANGELOG.md and
+manages the tag/push dance.
+
 Steps:
-  1. Validate the version, working tree, branch, and that main CI is green.
-  2. Rewrite src/chime/__init__.py with the new version.
+  1. Validate working tree, branch, and that main CI is green.
+  2. Resolve the new version (explicit arg or --part patch|minor|major).
   3. Promote CHANGELOG [Unreleased] into a dated [X.Y.Z] section and refresh
      the compare/tag link footer.
   4. Show the diff and ask for confirmation.
-  5. Commit + push the bump.
+  5. Commit + push the CHANGELOG bump.
   6. Wait for CI to go green on the new commit.
   7. Tag v<version> and push the tag — that triggers release.yml.
-  8. (Optional) Trigger the homebrew-tap bump workflow so brew users get the
-     new version without waiting for the next daily cron.
+  8. (Optional) Trigger the homebrew-tap bump workflow.
 
 Usage:
   python scripts/release.py 0.2.0
-  python scripts/release.py 0.2.0 --dry-run       # show planned edits, do nothing
-  python scripts/release.py 0.2.0 --yes           # skip the confirmation prompt
+  python scripts/release.py --part patch          # auto-bump from last tag
+  python scripts/release.py --part minor
+  python scripts/release.py 0.2.0 --dry-run       # preview edits
+  python scripts/release.py 0.2.0 --yes           # skip confirm
   python scripts/release.py 0.2.0 --no-brew-bump  # don't ping homebrew-tap
 """
 
@@ -32,11 +37,9 @@ from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-INIT_FILE = ROOT / "src" / "chime" / "__init__.py"
 CHANGELOG = ROOT / "CHANGELOG.md"
 
 SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$")
-VERSION_LINE = re.compile(r'^__version__\s*=\s*"([^"]+)"', re.MULTILINE)
 DIM = "\033[2m"
 BOLD = "\033[1m"
 GREEN = "\033[32m"
@@ -72,15 +75,32 @@ def confirm(prompt: str) -> bool:
 
 
 def current_version() -> str:
-    match = VERSION_LINE.search(INIT_FILE.read_text())
-    if not match:
-        die(f"could not find __version__ in {INIT_FILE.relative_to(ROOT)}")
-    return match.group(1)
+    """Latest released version — read from the most recent v* git tag."""
+    res = run(
+        ["git", "tag", "--list", "v*", "--sort=-version:refname"],
+        capture=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        die("could not list git tags")
+    tags = [t for t in res.stdout.splitlines() if SEMVER.match(t.lstrip("v"))]
+    if not tags:
+        die("no v* tags found — make the first release manually first")
+    return tags[0].lstrip("v")
 
 
 def parse_semver(v: str) -> tuple[int, int, int]:
     base = v.split("-", 1)[0].split("+", 1)[0]
     return tuple(int(x) for x in base.split("."))  # type: ignore[return-value]
+
+
+def bump_part(current: str, part: str) -> str:
+    major, minor, patch = parse_semver(current)
+    if part == "major":
+        return f"{major + 1}.0.0"
+    if part == "minor":
+        return f"{major}.{minor + 1}.0"
+    return f"{major}.{minor}.{patch + 1}"
 
 
 def check_clean_tree() -> None:
@@ -124,14 +144,6 @@ def check_main_ci_green() -> None:
 
 
 # ---------- file edits ----------
-
-
-def rewrite_version_file(new_version: str) -> str:
-    text = INIT_FILE.read_text()
-    new_text, n = VERSION_LINE.subn(f'__version__ = "{new_version}"', text, count=1)
-    if n != 1:
-        die("failed to rewrite __version__ line")
-    return new_text
 
 
 def rewrite_changelog(new_version: str, today: str, prev: str) -> str:
@@ -221,7 +233,12 @@ def main() -> None:
     p = argparse.ArgumentParser(
         prog="release", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("version", help="new version, e.g. 0.2.0")
+    p.add_argument("version", nargs="?", help="new version, e.g. 0.2.0")
+    p.add_argument(
+        "--part",
+        choices=["patch", "minor", "major"],
+        help="auto-bump from the latest v* tag instead of passing an explicit version",
+    )
     p.add_argument(
         "--dry-run", action="store_true", help="show planned edits, don't write or push anything"
     )
@@ -236,11 +253,13 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    new_version = args.version.lstrip("v")
-    if not SEMVER.match(new_version):
-        die(f"'{new_version}' is not a valid semver (e.g. 0.2.0)")
+    if bool(args.version) == bool(args.part):
+        die("pass either a positional version (0.2.0) OR --part (patch/minor/major)")
 
     current = current_version()
+    new_version = bump_part(current, args.part) if args.part else args.version.lstrip("v")
+    if not SEMVER.match(new_version):
+        die(f"'{new_version}' is not a valid semver (e.g. 0.2.0)")
     if parse_semver(new_version) <= parse_semver(current):
         die(f"new version {new_version} is not greater than current {current}")
 
@@ -252,17 +271,16 @@ def main() -> None:
         check_branch()
         check_main_ci_green()
 
-    new_init = rewrite_version_file(new_version)
     new_changelog = rewrite_changelog(new_version, date.today().isoformat(), current)
 
     print(c("planned edits:", BOLD))
-    print(c(f"  - {INIT_FILE.relative_to(ROOT)}: __version__ → {new_version}", DIM))
     print(
         c(
             f"  - {CHANGELOG.relative_to(ROOT)}: promote [Unreleased] → [{new_version}], add new [Unreleased]",
             DIM,
         )
     )
+    print(c("  - tag: v" + new_version + "  (version is derived from this by hatch-vcs)", DIM))
     print()
 
     if args.dry_run:
@@ -273,11 +291,10 @@ def main() -> None:
         print(c("aborted", YELLOW))
         sys.exit(0)
 
-    INIT_FILE.write_text(new_init)
     CHANGELOG.write_text(new_changelog)
 
     print(c("committing…", DIM))
-    run(["git", "add", str(INIT_FILE), str(CHANGELOG)])
+    run(["git", "add", str(CHANGELOG)])
     run(["git", "commit", "-m", f"chore: release v{new_version}"])
     commit_sha = run(["git", "rev-parse", "HEAD"], capture=True).stdout.strip()
 
