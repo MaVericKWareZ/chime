@@ -17,12 +17,13 @@ Steps:
   8. (Optional) Trigger the homebrew-tap bump workflow.
 
 Usage:
-  python scripts/release.py 0.2.0
-  python scripts/release.py --part patch          # auto-bump from last tag
-  python scripts/release.py --part minor
-  python scripts/release.py 0.2.0 --dry-run       # preview edits
-  python scripts/release.py 0.2.0 --yes           # skip confirm
-  python scripts/release.py 0.2.0 --no-brew-bump  # don't ping homebrew-tap
+  python scripts/release.py                       # patch bump (the default)
+  python scripts/release.py --part minor          # 0.1.0 -> 0.2.0
+  python scripts/release.py --part major          # 0.1.0 -> 1.0.0
+  python scripts/release.py 0.5.0                 # explicit version
+  python scripts/release.py --dry-run             # preview edits
+  python scripts/release.py --yes                 # skip confirm
+  python scripts/release.py --no-brew-bump        # don't ping homebrew-tap
 """
 
 from __future__ import annotations
@@ -253,8 +254,11 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    if bool(args.version) == bool(args.part):
-        die("pass either a positional version (0.2.0) OR --part (patch/minor/major)")
+    if args.version and args.part:
+        die("can't combine positional version and --part")
+    # Default: patch bump. The bare `release` command is the common case.
+    if not args.version and not args.part:
+        args.part = "patch"
 
     current = current_version()
     new_version = bump_part(current, args.part) if args.part else args.version.lstrip("v")

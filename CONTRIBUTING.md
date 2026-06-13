@@ -8,10 +8,11 @@ Thanks for thinking about contributing! chime is small and the bar is friendly �
 git clone https://github.com/MaVericKWareZ/chime
 cd chime
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-pre-commit install
-pytest
+make install   # editable install with dev deps + pre-commit hooks
+make test
 ```
+
+`make help` lists every dev/release/build target the project supports — that's the canonical reference, not this document.
 
 ## Making a change
 
@@ -34,29 +35,26 @@ pytest
 
 ## Releasing (maintainers)
 
-The fast path is the helper script:
+The version is derived from the git tag at build time (hatch-vcs), so there's
+no version string to edit. Just:
 
 ```bash
-python scripts/release.py 0.2.0
+make release          # patch bump (most common)
+make release-minor    # minor bump
+make release-major    # major bump
+# or, for an explicit version:
+python scripts/release.py 0.5.0
 ```
 
-It validates the working tree and branch, confirms main CI is green, rewrites
-`src/chime/__init__.py` and `CHANGELOG.md`, shows the planned edits, asks for
-confirmation, commits, pushes, waits for CI on the new commit, tags `v0.2.0`,
-pushes the tag, and (unless `--no-brew-bump`) triggers the homebrew-tap bump
-workflow. `--dry-run` shows planned edits without writing.
+The helper validates the working tree and branch, confirms main CI is green,
+rewrites `CHANGELOG.md`, shows the planned edits, asks for confirmation,
+commits, pushes, waits for CI on the new commit, tags `vX.Y.Z`, pushes the
+tag, and (unless `--no-brew-bump`) triggers the homebrew-tap bump workflow.
+Add `--dry-run` to preview without writing — or just `make release-dry`.
 
 The actual publish work is done by `.github/workflows/release.yml`, which fires
 when the `v*.*.*` tag is pushed: build → PyPI via trusted publishing → GitHub
 release.
-
-If you prefer to do it by hand:
-
-1. Bump `__version__` in `src/chime/__init__.py`.
-2. Promote the `CHANGELOG.md` `[Unreleased]` block to a dated `[X.Y.Z]` section
-   and refresh the link footer.
-3. Commit, push, wait for CI to pass on `main`.
-4. `git tag vX.Y.Z && git push --tags`.
 
 First-time PyPI setup: register the project at
 <https://pypi.org/manage/account/publishing/> with `owner=<your gh user>`,
