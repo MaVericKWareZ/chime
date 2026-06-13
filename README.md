@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="chime" width="800">
+</p>
+
 # chime
 
 > Friendly terminal alarms, timers & pomodoro for macOS, Linux, and Windows.
