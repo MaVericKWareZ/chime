@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the 
 
 ## [Unreleased]
 
+### Added
+- Windows support: `winsound` for system sound aliases, PowerShell toast notifications (Win 10+), PowerShell SAPI for `--say`, and `subprocess.Popen` with `DETACHED_PROCESS` for `--bg`.
+- Windows added to CI test matrix.
+- `Operating System :: Microsoft :: Windows` PyPI classifier.
+
+### Changed
+- Background state file lives under `%LOCALAPPDATA%\chime\` on Windows (still `$XDG_STATE_HOME/chime/` on POSIX).
+- Default sound on Windows is `SystemAsterisk` (no `Glass.aiff` available).
+- Bumped GitHub Actions: `checkout` 4→6, `setup-python` 5→6, `upload-artifact` 4→7, `download-artifact` 4→8.
+- README: documented `brew install MaVericKWareZ/tap/chime` install path.
+
 ## [0.1.0]
 
 ### Added

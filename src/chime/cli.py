@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
+import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
@@ -57,6 +60,7 @@ SUBCOMMANDS = {
     "cancel",
     "sounds",
     "version",
+    "_bg-runner",  # internal: invoked by spawned background process on Windows
 }
 BOOL_FLAGS = {"--bg", "--say", "--no-sound"}
 VALUE_FLAGS = {"--sound", "--repeat"}
@@ -98,27 +102,18 @@ def run_background(
     do_say: bool,
     silent: bool,
 ) -> None:
-    """Detach via double-style fork. Parent registers + returns; child sleeps and fires."""
+    """Spawn a detached background process that sleeps and fires the alarm.
+
+    POSIX: double-style fork + setsid.
+    Windows: subprocess.Popen with DETACHED_PROCESS, re-invoking chime with
+             the internal `_bg-runner` subcommand.
+    """
+    if sys.platform == "win32":
+        _run_background_windows(seconds, message, sound, repeat, do_say, silent)
+        return
     pid = os.fork()
     if pid > 0:
-        target = datetime.now() + timedelta(seconds=seconds)
-        state.add(
-            {
-                "pid": pid,
-                "message": message or "",
-                "target": target.isoformat(timespec="seconds"),
-                "started": datetime.now().isoformat(timespec="seconds"),
-                "sound": sound,
-                "silent": silent,
-            }
-        )
-        print(
-            c(f"⏰  alarm set for {target.strftime('%H:%M:%S')}", GREEN)
-            + c(f"  (id {pid}, in {fmt_duration(seconds)})", DIM)
-        )
-        if message:
-            print(c(f"    message: {message}", DIM))
-        print(c(f"    cancel:  chime cancel {pid}", DIM))
+        _register_bg(pid, seconds, message, sound, silent)
         return
     os.setsid()
     devnull = os.open(os.devnull, os.O_RDWR)
@@ -132,6 +127,61 @@ def run_background(
             state.remove(os.getpid())
         finally:
             os._exit(0)
+
+
+def _run_background_windows(
+    seconds: float,
+    message: str | None,
+    sound: str,
+    repeat: int,
+    do_say: bool,
+    silent: bool,
+) -> None:
+    payload = json.dumps(
+        {
+            "seconds": seconds,
+            "message": message or "",
+            "sound": sound,
+            "repeat": repeat,
+            "say": do_say,
+            "silent": silent,
+        }
+    )
+    encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    CREATE_NO_WINDOW = 0x08000000
+    flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "chime", "_bg-runner", encoded],
+        creationflags=flags,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    _register_bg(proc.pid, seconds, message, sound, silent)
+
+
+def _register_bg(pid: int, seconds: float, message: str | None, sound: str, silent: bool) -> None:
+    target = datetime.now() + timedelta(seconds=seconds)
+    state.add(
+        {
+            "pid": pid,
+            "message": message or "",
+            "target": target.isoformat(timespec="seconds"),
+            "started": datetime.now().isoformat(timespec="seconds"),
+            "sound": sound,
+            "silent": silent,
+        }
+    )
+    print(
+        c(f"⏰  alarm set for {target.strftime('%H:%M:%S')}", GREEN)
+        + c(f"  (id {pid}, in {fmt_duration(seconds)})", DIM)
+    )
+    if message:
+        print(c(f"    message: {message}", DIM))
+    print(c(f"    cancel:  chime cancel {pid}", DIM))
 
 
 def run_alarm(
@@ -281,6 +331,26 @@ def cmd_version(args: argparse.Namespace) -> None:
     print(f"chime {__version__}")
 
 
+def cmd_bg_runner(args: argparse.Namespace) -> None:
+    """Internal: invoked by the Windows background spawn. Not user-facing."""
+    try:
+        payload = json.loads(base64.b64decode(args.payload).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        sys.exit(0)
+    try:
+        time.sleep(max(0, float(payload.get("seconds", 0))))
+        alerts.trigger(
+            payload.get("message") or None,
+            payload.get("sound") or alerts.DEFAULT_SOUND,
+            int(payload.get("repeat", 3)),
+            bool(payload.get("say", False)),
+            bool(payload.get("silent", False)),
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            state.remove(os.getpid())
+
+
 # ---------- argparse + dispatch ----------
 
 
@@ -325,6 +395,11 @@ def _make_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("version", add_help=False)
     sp.set_defaults(func=cmd_version)
+
+    # Internal — invoked by the Windows background spawn. Not documented.
+    sp = sub.add_parser("_bg-runner", add_help=False)
+    sp.add_argument("payload")
+    sp.set_defaults(func=cmd_bg_runner)
 
     return p
 

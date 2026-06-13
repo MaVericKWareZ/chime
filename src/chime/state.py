@@ -8,13 +8,21 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 
 def state_dir() -> Path:
     base = os.environ.get("XDG_STATE_HOME")
-    root = Path(base) if base else Path.home() / ".local" / "state"
+    if base:
+        root = Path(base)
+    elif sys.platform == "win32":
+        # Use LOCALAPPDATA on Windows
+        localappdata = os.environ.get("LOCALAPPDATA")
+        root = Path(localappdata) if localappdata else Path.home() / "AppData" / "Local"
+    else:
+        root = Path.home() / ".local" / "state"
     d = root / "chime"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -40,11 +48,33 @@ def save(alarms: list[dict[str, Any]]) -> None:
 
 
 def is_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        return _is_alive_windows(pid)
     try:
         os.kill(pid, 0)
         return True
     except (OSError, ProcessLookupError):
         return False
+
+
+def _is_alive_windows(pid: int) -> bool:
+    """On Windows, os.kill(pid, 0) raises — use OpenProcess via ctypes instead."""
+    import ctypes  # noqa: PLC0415 — Windows-only path
+    from ctypes import wintypes  # noqa: PLC0415 — wintypes is Windows-only
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return exit_code.value == STILL_ACTIVE
+        return True
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def prune() -> list[dict[str, Any]]:

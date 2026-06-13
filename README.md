@@ -1,6 +1,6 @@
 # chime
 
-> Friendly terminal alarms, timers & pomodoro for macOS and Linux.
+> Friendly terminal alarms, timers & pomodoro for macOS, Linux, and Windows.
 
 [![CI](https://github.com/MaVericKWareZ/chime/actions/workflows/ci.yml/badge.svg)](https://github.com/MaVericKWareZ/chime/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/chime-cli.svg)](https://pypi.org/project/chime-cli/)
@@ -20,13 +20,21 @@ $ chime 10m "tea is ready"
 
 ## Install
 
+**Homebrew (macOS/Linux):**
+
 ```bash
-pipx install chime-cli      # recommended — isolates the install
+brew install MaVericKWareZ/tap/chime
+```
+
+**pipx (any platform):**
+
+```bash
+pipx install chime-cli      # recommended for non-mac users — isolates the install
 # or
 pip install --user chime-cli
 ```
 
-That gives you the `chime` command on your PATH.
+Either gets you the `chime` command on your PATH.
 
 ### From source
 
@@ -80,13 +88,18 @@ Available on any alarm-setting command, in any position:
 | --- | --- | --- | --- |
 | macOS | `osascript` | `afplay` + system sounds | `say` |
 | Linux | `notify-send` (libnotify) | `paplay` / `aplay` | `spd-say` / `espeak` |
-| Windows | not yet — PRs welcome | terminal bell | — |
+| Windows | PowerShell toast (Win 10+) | `winsound` (stdlib) | PowerShell SAPI |
 
 Linux users typically already have these tools; on a fresh system: `sudo apt install libnotify-bin pulseaudio-utils` (Debian/Ubuntu) gets you notifications + sound.
 
 ## Background alarms
 
-When you use `--bg`, chime double-forks and detaches from your shell. You can close the terminal — the alarm still fires. State lives at `$XDG_STATE_HOME/chime/alarms.json` (defaults to `~/.local/state/chime/alarms.json`). Stale entries from killed processes are pruned automatically the next time you run `chime list` or `chime cancel`.
+When you use `--bg`, chime detaches from your shell — you can close the terminal and the alarm still fires.
+
+- **POSIX (macOS/Linux):** double-fork + `setsid`. State at `$XDG_STATE_HOME/chime/alarms.json` (defaults to `~/.local/state/chime/alarms.json`).
+- **Windows:** `subprocess.Popen` with `DETACHED_PROCESS` flags. State at `%LOCALAPPDATA%\chime\alarms.json`.
+
+Stale entries from killed processes are pruned automatically the next time you run `chime list` or `chime cancel`.
 
 ## Development
 

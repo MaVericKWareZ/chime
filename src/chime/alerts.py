@@ -3,11 +3,13 @@
 Backends are selected by `sys.platform`:
   - darwin → osascript / afplay / say
   - linux  → notify-send / paplay / aplay / spd-say (falls back to bell)
+  - win32  → winsound (stdlib) + PowerShell toast / SAPI
   - other  → terminal bell only
 """
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import shutil
 import subprocess
@@ -17,14 +19,26 @@ from pathlib import Path
 
 from chime.term import BOLD, DIM, YELLOW, c
 
-DEFAULT_SOUND = "Glass"
+DEFAULT_SOUND = "Glass" if sys.platform != "win32" else "SystemAsterisk"
 
 _MAC_SOUNDS_DIR = Path("/System/Library/Sounds")
 _LINUX_SOUND_DIRS = [
     Path("/usr/share/sounds/freedesktop/stereo"),
     Path("/usr/share/sounds/alsa"),
 ]
+_WIN_SOUND_ALIASES = (
+    "SystemAsterisk",
+    "SystemExclamation",
+    "SystemHand",
+    "SystemQuestion",
+    "SystemDefault",
+)
 _DEVNULL = subprocess.DEVNULL
+
+
+def _ps_encoded(script: str) -> str:
+    """PowerShell -EncodedCommand input: UTF-16-LE base64. Sidesteps shell quoting."""
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
 
 
 def _run_quiet(cmd: list[str]) -> int:
@@ -47,6 +61,8 @@ def list_sounds() -> list[str]:
                 out.extend(sorted(f.stem for f in d.glob("*.oga")))
                 out.extend(sorted(f.stem for f in d.glob("*.wav")))
         return out
+    if sys.platform == "win32":
+        return list(_WIN_SOUND_ALIASES)
     return []
 
 
@@ -75,6 +91,9 @@ def _resolve_sound_path(sound: str | None) -> Path | None:
 
 def play_sound(sound: str | None, repeat: int = 1) -> None:
     repeat = max(1, repeat)
+    if sys.platform == "win32":
+        _play_sound_windows(sound, repeat)
+        return
     path = _resolve_sound_path(sound)
     if path is None:
         for _ in range(repeat):
@@ -95,6 +114,20 @@ def play_sound(sound: str | None, repeat: int = 1) -> None:
         _run_quiet([player, *args])
 
 
+def _play_sound_windows(sound: str | None, repeat: int) -> None:
+    try:
+        import winsound  # noqa: PLC0415 — Windows-only stdlib module
+    except ImportError:
+        for _ in range(repeat):
+            print("\a", end="", flush=True)
+        return
+    alias = sound if sound in _WIN_SOUND_ALIASES else DEFAULT_SOUND
+    flags = winsound.SND_ALIAS | winsound.SND_NODEFAULT
+    for _ in range(repeat):
+        with contextlib.suppress(RuntimeError, OSError):
+            winsound.PlaySound(alias, flags)
+
+
 # ---------- notifications ----------
 
 
@@ -110,7 +143,33 @@ def notify(title: str, message: str, *, sound: str | None = None) -> None:
     if sys.platform.startswith("linux") and shutil.which("notify-send"):
         _run_quiet(["notify-send", safe_title, safe_msg])
         return
+    if sys.platform == "win32":
+        _notify_windows(safe_title, safe_msg)
+        return
     # Silent fallback — terminal output is the only signal.
+
+
+def _notify_windows(title: str, message: str) -> None:
+    """Best-effort Windows toast via PowerShell + WinRT. No-ops on failure."""
+    if not shutil.which("powershell"):
+        return
+    # Escape single quotes for the embedded XML literal.
+    t = title.replace("'", "&apos;").replace("<", "&lt;").replace(">", "&gt;")
+    m = message.replace("'", "&apos;").replace("<", "&lt;").replace(">", "&gt;")
+    xml = (
+        f"<toast><visual><binding template='ToastText02'>"
+        f"<text id='1'>{t}</text><text id='2'>{m}</text>"
+        f"</binding></visual></toast>"
+    )
+    script = (
+        "$ErrorActionPreference = 'SilentlyContinue';"
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;"
+        "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument;"
+        f'$xml.LoadXml("{xml}");'
+        "$toast = New-Object Windows.UI.Notifications.ToastNotification $xml;"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('chime').Show($toast)"
+    )
+    _run_quiet(["powershell", "-NoProfile", "-EncodedCommand", _ps_encoded(script)])
 
 
 # ---------- speech ----------
@@ -128,6 +187,20 @@ def speak(message: str) -> None:
                 with contextlib.suppress(FileNotFoundError, OSError):
                     subprocess.Popen(cmd, stdout=_DEVNULL, stderr=_DEVNULL)
                 return
+        return
+    if sys.platform == "win32" and shutil.which("powershell"):
+        # SAPI via PowerShell — fire and forget.
+        safe = text.replace('"', "'").replace("\\", " ")
+        script = (
+            "Add-Type -AssemblyName System.Speech;"
+            f'(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("{safe}")'
+        )
+        with contextlib.suppress(FileNotFoundError, OSError):
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-EncodedCommand", _ps_encoded(script)],
+                stdout=_DEVNULL,
+                stderr=_DEVNULL,
+            )
 
 
 # ---------- composite ----------
