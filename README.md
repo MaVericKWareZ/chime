@@ -1,19 +1,17 @@
 <p align="center">
-  <img src="assets/banner.png" alt="chime" width="800">
+  <img src="assets/banner.png" alt="chime — friendly terminal alarms, timers & pomodoro" width="720">
 </p>
 
-# chime
+<p align="center">
+  <a href="https://github.com/MaVericKWareZ/chime/actions/workflows/ci.yml"><img src="https://github.com/MaVericKWareZ/chime/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://pypi.org/project/chime-cli/"><img src="https://img.shields.io/pypi/v/chime-cli.svg" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/chime-cli/"><img src="https://img.shields.io/pypi/pyversions/chime-cli.svg" alt="Python versions"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+</p>
 
-> Friendly terminal alarms, timers & pomodoro for macOS, Linux, and Windows.
+A no-fuss CLI for the things you actually use timers for: a quick countdown, an alarm at 3pm, and pomodoro rounds when you need to focus. Zero runtime dependencies — just the Python standard library.
 
-[![CI](https://github.com/MaVericKWareZ/chime/actions/workflows/ci.yml/badge.svg)](https://github.com/MaVericKWareZ/chime/actions/workflows/ci.yml)
-[![PyPI version](https://img.shields.io/pypi/v/chime-cli.svg)](https://pypi.org/project/chime-cli/)
-[![Python versions](https://img.shields.io/pypi/pyversions/chime-cli.svg)](https://pypi.org/project/chime-cli/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
-A no-fuss CLI for the things you actually use timers for: a quick countdown, an alarm at 3pm, and pomodoro rounds when you need to focus. Zero dependencies, just the Python standard library.
-
-```
+```text
 $ chime 10m "tea is ready"
 ⏳  tea is ready
   target 16:42:11  ·  10m from now
@@ -22,31 +20,42 @@ $ chime 10m "tea is ready"
   09:58
 ```
 
+## Features
+
+- Countdown timers with natural durations (`10m`, `1h30m`, `90s`, `0.5h`)
+- Clock-time alarms (`at 9am`, `at 15:30`, `at "tomorrow 9am"`)
+- Pomodoro mode — configurable work / break / rounds
+- Stopwatch (count-up)
+- Background alarms (`--bg`) that survive shell exit, with `list` / `cancel`
+- Native desktop notifications + system sounds on macOS, Linux, and Windows
+- Optional spoken alerts (`--say`)
+- Zero runtime dependencies — just the Python standard library
+
 ## Install
 
-**Homebrew (macOS/Linux):**
+**Homebrew (macOS / Linux):**
 
 ```bash
 brew install MaVericKWareZ/tap/chime
 ```
 
-**pipx (any platform):**
+**pipx (cross-platform, recommended for Windows):**
 
 ```bash
-pipx install chime-cli      # recommended for non-mac users — isolates the install
+pipx install chime-cli
 # or
 pip install --user chime-cli
 ```
 
-Either gets you the `chime` command on your PATH.
-
-### From source
+**From source:**
 
 ```bash
 git clone https://github.com/MaVericKWareZ/chime
 cd chime
 pipx install .
 ```
+
+Any of these puts a `chime` command on your PATH.
 
 ## Usage
 
@@ -75,8 +84,8 @@ Available on any alarm-setting command, in any position:
 - `--bg` — run in background, return immediately
 - `--sound NAME` — use a different alert sound (`chime sounds` to list)
 - `--repeat N` — repeat the alert sound N times (default 3)
-- `--say` — speak the message aloud (uses `say` on macOS, `spd-say`/`espeak` on Linux)
-- `--no-sound` — silent — desktop notification only
+- `--say` — speak the message aloud (uses `say` on macOS, `spd-say` / `espeak` on Linux, PowerShell SAPI on Windows)
+- `--no-sound` — silent (desktop notification only)
 
 ### Duration formats
 
@@ -94,13 +103,13 @@ Available on any alarm-setting command, in any position:
 | Linux | `notify-send` (libnotify) | `paplay` / `aplay` | `spd-say` / `espeak` |
 | Windows | PowerShell toast (Win 10+) | `winsound` (stdlib) | PowerShell SAPI |
 
-Linux users typically already have these tools; on a fresh system: `sudo apt install libnotify-bin pulseaudio-utils` (Debian/Ubuntu) gets you notifications + sound.
+Linux users typically already have these tools; on a fresh system: `sudo apt install libnotify-bin pulseaudio-utils` (Debian / Ubuntu) gets you notifications + sound.
 
 ## Background alarms
 
 When you use `--bg`, chime detaches from your shell — you can close the terminal and the alarm still fires.
 
-- **POSIX (macOS/Linux):** double-fork + `setsid`. State at `$XDG_STATE_HOME/chime/alarms.json` (defaults to `~/.local/state/chime/alarms.json`).
+- **POSIX (macOS / Linux):** double-fork + `setsid`. State at `$XDG_STATE_HOME/chime/alarms.json` (defaults to `~/.local/state/chime/alarms.json`).
 - **Windows:** `subprocess.Popen` with `DETACHED_PROCESS` flags. State at `%LOCALAPPDATA%\chime\alarms.json`.
 
 Stale entries from killed processes are pruned automatically the next time you run `chime list` or `chime cancel`.
@@ -111,16 +120,19 @@ Stale entries from killed processes are pruned automatically the next time you r
 git clone https://github.com/MaVericKWareZ/chime
 cd chime
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-
-pre-commit install   # auto-lint on commit
-
-pytest               # run tests
-ruff check .         # lint
-ruff format .        # auto-format
-python -m build      # build sdist + wheel
+make install      # editable install + dev deps + pre-commit hooks
+make help         # discover every dev / build / release target
 ```
+
+`make test`, `make lint`, `make fmt`, `make build` are the common ones. See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor guide and the release process.
+
+## Links
+
+- [Changelog](CHANGELOG.md) — what changed, version by version
+- [Contributing](CONTRIBUTING.md) — dev setup, code style, release flow
+- [Security policy](SECURITY.md) — how to report a vulnerability
+- [Issue tracker](https://github.com/MaVericKWareZ/chime/issues)
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE) © Sarthak Mahapatra
