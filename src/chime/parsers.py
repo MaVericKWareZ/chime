@@ -4,6 +4,17 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta
+from typing import NamedTuple
+from zoneinfo import ZoneInfo
+
+from chime import tz as _tz
+
+
+class ParsedTime(NamedTuple):
+    target: datetime
+    source_tz: ZoneInfo | None
+    source_label: str | None
+
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _DURATION_PATTERN = re.compile(r"(\d+(?:\.\d+)?)([smhd])")
@@ -31,15 +42,30 @@ def parse_duration(s: str) -> float:
     return total
 
 
-def parse_time(s: str, *, now: datetime | None = None) -> datetime:
+def parse_time(s: str, *, now: datetime | None = None) -> ParsedTime:
     """Parse '15:30', '3:30pm', '9am', 'tomorrow 9am' → future datetime.
+
+    An optional trailing token (``UTC`` or any token containing ``/``) is
+    interpreted as a source timezone and resolved via :mod:`chime.tz`.
 
     Past clock times roll forward to tomorrow.
     """
-    s = s.strip().lower().replace(" ", "")
+    raw = s.strip()
+    if not raw:
+        raise ValueError("empty time")
+    source_tz: ZoneInfo | None = None
+    source_label: str | None = None
+    tokens = raw.split()
+    if len(tokens) >= 2:
+        last = tokens[-1]
+        if last.upper() == "UTC" or "/" in last:
+            zone, label = _tz.resolve(last)
+            source_tz = zone
+            source_label = label
+            raw = " ".join(tokens[:-1])
+    s = raw.lower().replace(" ", "")
     if not s:
         raise ValueError("empty time")
-    now = now or datetime.now()
     days_ahead = 0
     if s.startswith("tomorrow"):
         days_ahead = 1
@@ -70,11 +96,25 @@ def parse_time(s: str, *, now: datetime | None = None) -> datetime:
             hour = 0
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         raise ValueError(f"invalid time: {hour:02d}:{minute:02d}")
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if source_tz is None:
+        now = now or datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        target += timedelta(days=days_ahead)
+        if days_ahead == 0 and target <= now:
+            target += timedelta(days=1)
+        return ParsedTime(target, None, None)
+    # Source-tz path: interpret the wall-clock in the source zone.
+    if now is None:
+        now_in_source = datetime.now(tz=source_tz)
+    elif now.tzinfo is None:
+        now_in_source = now.replace(tzinfo=source_tz)
+    else:
+        now_in_source = now.astimezone(source_tz)
+    target = now_in_source.replace(hour=hour, minute=minute, second=0, microsecond=0)
     target += timedelta(days=days_ahead)
-    if days_ahead == 0 and target <= now:
+    if days_ahead == 0 and target <= now_in_source:
         target += timedelta(days=1)
-    return target
+    return ParsedTime(target, source_tz, source_label)
 
 
 def fmt_duration(sec: float) -> str:

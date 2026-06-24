@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any
 
-from chime import __version__, alerts, state
+from chime import __version__, alerts, state, tz
 from chime.parsers import fmt_clock, fmt_duration, parse_duration, parse_time
 from chime.term import BOLD, CYAN, DIM, GREEN, MAGENTA, RED, YELLOW, c
 
@@ -185,7 +185,11 @@ def _register_bg(pid: int, seconds: float, message: str | None, sound: str, sile
 
 
 def run_alarm(
-    seconds: float, message: str | None, opts: Any, target_dt: datetime | None = None
+    seconds: float,
+    message: str | None,
+    opts: Any,
+    target_dt: datetime | None = None,
+    source_label: str | None = None,
 ) -> None:
     if seconds <= 0:
         print(c("error: target time is in the past", RED))
@@ -197,7 +201,10 @@ def run_alarm(
     title = message if message else "timer"
     label = c(f"⏳  {title}", BOLD + CYAN)
     if target_dt is not None:
-        label += c(f"  @ {target_dt.strftime('%H:%M')}", DIM)
+        suffix = f"  @ {target_dt.strftime('%H:%M')}"
+        if source_label is not None:
+            suffix += f" {source_label}"
+        label += c(suffix, DIM)
     if countdown(seconds, label=label):
         alerts.trigger(message, sound, opts.repeat, opts.say, opts.no_sound)
 
@@ -207,13 +214,23 @@ def run_alarm(
 
 def cmd_at(args: argparse.Namespace) -> None:
     try:
-        target = parse_time(args.time)
+        parsed = parse_time(args.time)
     except ValueError as e:
         print(c(f"error: {e}", RED))
         sys.exit(2)
-    seconds = (target - datetime.now()).total_seconds()
+    target = parsed.target
+    source_label: str | None = None
+    if parsed.source_tz is None:
+        seconds = (target - datetime.now()).total_seconds()
+    else:
+        sys_tz = tz.system_tz()
+        seconds = (target - datetime.now(tz=sys_tz)).total_seconds()
+        src_key = getattr(parsed.source_tz, "key", str(parsed.source_tz))
+        sys_key = getattr(sys_tz, "key", str(sys_tz))
+        if src_key != sys_key:
+            source_label = target.tzname()
     message = " ".join(args.message) if args.message else None
-    run_alarm(seconds, message, args, target_dt=target)
+    run_alarm(seconds, message, args, target_dt=target, source_label=source_label)
 
 
 def cmd_pomodoro(args: argparse.Namespace) -> None:

@@ -1,8 +1,9 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from chime.parsers import fmt_clock, fmt_duration, parse_duration, parse_time
+from chime.parsers import ParsedTime, fmt_clock, fmt_duration, parse_duration, parse_time
 
 
 class TestParseDuration:
@@ -54,20 +55,23 @@ class TestParseTime:
     )
     def test_valid_times(self, text, hour, minute, day_offset):
         result = parse_time(text, now=self.now)
-        assert result.hour == hour
-        assert result.minute == minute
-        assert (result.date() - self.now.date()).days == day_offset
+        assert isinstance(result, ParsedTime)
+        assert result.target.hour == hour
+        assert result.target.minute == minute
+        assert (result.target.date() - self.now.date()).days == day_offset
+        assert result.source_tz is None
+        assert result.source_label is None
 
     def test_tomorrow_prefix(self):
         result = parse_time("tomorrow 9am", now=self.now)
-        assert result.hour == 9
-        assert (result.date() - self.now.date()).days == 1
+        assert result.target.hour == 9
+        assert (result.target.date() - self.now.date()).days == 1
 
     def test_tomorrow_at_prefix(self):
         result = parse_time("tomorrow at 15:30", now=self.now)
-        assert result.hour == 15
-        assert result.minute == 30
-        assert (result.date() - self.now.date()).days == 1
+        assert result.target.hour == 15
+        assert result.target.minute == 30
+        assert (result.target.date() - self.now.date()).days == 1
 
     def test_case_insensitive(self):
         assert parse_time("3:30PM", now=self.now) == parse_time("3:30pm", now=self.now)
@@ -77,7 +81,46 @@ class TestParseTime:
 
     def test_target_is_future(self):
         result = parse_time("9am", now=self.now)
-        assert result > self.now
+        assert result.target > self.now
+
+    def test_no_tz_path_returns_naive_target(self):
+        result = parse_time("9am", now=self.now)
+        assert result.target.tzinfo is None
+        assert result.source_tz is None
+        assert result.source_label is None
+
+    def test_trailing_utc_token(self):
+        # 14:00 IST = 08:30 UTC, so 9am UTC is still ahead today.
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am UTC", now=aware_now)
+        assert result.source_tz == ZoneInfo("UTC")
+        assert result.source_label == "UTC"
+        assert result.target.tzinfo == ZoneInfo("UTC")
+        assert result.target.hour == 9
+        assert result.target.minute == 0
+
+    def test_trailing_iana_token(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am America/New_York", now=aware_now)
+        assert result.source_tz == ZoneInfo("America/New_York")
+        assert result.source_label == "America/New_York"
+        assert result.target.tzinfo == ZoneInfo("America/New_York")
+        assert result.target.hour == 9
+        # June → EDT, the resolved tzname at the target moment
+        assert result.target.tzname() == "EDT"
+
+    def test_invalid_iana_raises_value_error(self):
+        with pytest.raises(ValueError):
+            parse_time("9am Mars/Bogus", now=self.now)
+
+    def test_tomorrow_prefix_with_tz(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("tomorrow 9am UTC", now=aware_now)
+        assert result.source_tz == ZoneInfo("UTC")
+        assert result.target.hour == 9
+        # 14:00 IST on 13 June = 08:30 UTC on 13 June.
+        # tomorrow → target should be on 14 June UTC.
+        assert result.target.date().day == 14
 
     @pytest.mark.parametrize(
         "text",

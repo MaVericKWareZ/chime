@@ -2,10 +2,14 @@
 
 import subprocess
 import sys
+from datetime import datetime
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from chime.cli import _split_flags
+from chime import cli
+from chime.cli import _split_flags, cmd_at, run_alarm
 
 CHIME = [sys.executable, "-m", "chime"]
 
@@ -81,3 +85,98 @@ class TestCommandSurface:
     def test_unknown_flag_exits_with_error(self):
         result = run(["--bogus", "10m"])
         assert result.returncode == 2
+
+
+def _fake_opts(**overrides):
+    base = dict(bg=False, sound=None, repeat=1, say=None, no_sound=True)
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _capture_label(monkeypatch):
+    """Patch chime.cli.countdown to capture the label and short-circuit."""
+    captured = {}
+
+    def fake_countdown(seconds, label=None):
+        captured["label"] = label
+        captured["seconds"] = seconds
+        return False  # do not trigger alerts
+
+    monkeypatch.setattr(cli, "countdown", fake_countdown)
+    return captured
+
+
+class TestForegroundHeader:
+    def test_no_target_dt_header_unchanged(self, monkeypatch):
+        captured = _capture_label(monkeypatch)
+        run_alarm(60, "hi", _fake_opts())
+        assert "@" not in captured["label"]
+        assert "hi" in captured["label"]
+
+    def test_naive_target_dt_header_byte_identical(self, monkeypatch):
+        captured = _capture_label(monkeypatch)
+        target = datetime(2026, 6, 13, 9, 0, 0)  # naive — today's no-tz path
+        run_alarm(60, "hi", _fake_opts(), target_dt=target)
+        assert "@ 09:00" in captured["label"]
+        # No source label — same-tz / no-tz path
+        assert "UTC" not in captured["label"]
+        assert "EDT" not in captured["label"]
+
+    def test_source_label_appended(self, monkeypatch):
+        captured = _capture_label(monkeypatch)
+        target = datetime(2026, 6, 13, 9, 0, 0, tzinfo=ZoneInfo("UTC"))
+        run_alarm(60, "meeting", _fake_opts(), target_dt=target, source_label="UTC")
+        assert "@ 09:00 UTC" in captured["label"]
+
+    def test_cmd_at_utc_from_non_utc_system_shows_suffix(self, monkeypatch):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("Asia/Kolkata"))
+        captured = _capture_label(monkeypatch)
+        cmd_at(
+            SimpleNamespace(
+                time="9am UTC",
+                message=["meeting"],
+                bg=False,
+                sound=None,
+                repeat=1,
+                say=None,
+                no_sound=True,
+            )
+        )
+        assert "@ 09:00 UTC" in captured["label"]
+
+    def test_cmd_at_same_tz_no_suffix(self, monkeypatch):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("America/Los_Angeles"))
+        captured = _capture_label(monkeypatch)
+        cmd_at(
+            SimpleNamespace(
+                time="9am America/Los_Angeles",
+                message=["standup"],
+                bg=False,
+                sound=None,
+                repeat=1,
+                say=None,
+                no_sound=True,
+            )
+        )
+        assert "@ 09:00" in captured["label"]
+        # source == system local → no suffix
+        for tzname in ("PDT", "PST", "America/Los_Angeles"):
+            assert tzname not in captured["label"]
+
+    def test_cmd_at_invalid_iana_exits_2_no_stdlib_leak(self, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cmd_at(
+                SimpleNamespace(
+                    time="9am Mars/Bogus",
+                    message=["x"],
+                    bg=False,
+                    sound=None,
+                    repeat=1,
+                    say=None,
+                    no_sound=True,
+                )
+            )
+        assert exc.value.code == 2
+        out = capsys.readouterr().out
+        assert "unknown timezone" in out
+        assert "ZoneInfoNotFoundError" not in out
