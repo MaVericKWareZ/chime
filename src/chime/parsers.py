@@ -45,8 +45,9 @@ def parse_duration(s: str) -> float:
 def parse_time(s: str, *, now: datetime | None = None) -> ParsedTime:
     """Parse '15:30', '3:30pm', '9am', 'tomorrow 9am' → future datetime.
 
-    An optional trailing token (``UTC`` or any token containing ``/``) is
-    interpreted as a source timezone and resolved via :mod:`chime.tz`.
+    An optional trailing token — an unambiguous tz abbreviation (``EDT``, ``PST``,
+    ``GMT``, …) or any token containing ``/`` (an IANA name) — is interpreted as a
+    source timezone and resolved via :mod:`chime.tz`.
 
     Past clock times roll forward to tomorrow.
     """
@@ -58,7 +59,7 @@ def parse_time(s: str, *, now: datetime | None = None) -> ParsedTime:
     tokens = raw.split()
     if len(tokens) >= 2:
         last = tokens[-1]
-        if last.upper() == "UTC" or "/" in last:
+        if _tz.is_recognized_abbrev(last) or "/" in last:
             zone, label = _tz.resolve(last)
             source_tz = zone
             source_label = label

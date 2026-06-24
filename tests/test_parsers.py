@@ -109,6 +109,35 @@ class TestParseTime:
         # June → EDT, the resolved tzname at the target moment
         assert result.target.tzname() == "EDT"
 
+    def test_trailing_abbreviation_token(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am EDT", now=aware_now)
+        assert result.source_tz == ZoneInfo("America/New_York")
+        assert result.source_label == "EDT"
+        assert result.target.tzinfo.key == "America/New_York"
+        assert result.target.hour == 9
+
+    @pytest.mark.parametrize("text", ["9am pst", "9am Edt", "9am eDt"])
+    def test_trailing_abbreviation_case_insensitive(self, text):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time(text, now=aware_now)
+        assert result.source_tz is not None
+        assert result.target.tzinfo is not None
+
+    def test_abbreviation_dst_flip_summer(self):
+        # EST typed against a June `now` resolves to a wall-clock that is actually
+        # EDT at the target moment — the abbreviation is an alias, not an offset.
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am EST", now=aware_now)
+        assert result.source_label == "EST"
+        assert result.target.tzname() == "EDT"
+
+    def test_abbreviation_dst_flip_winter(self):
+        aware_now = datetime(2026, 1, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am EDT", now=aware_now)
+        assert result.source_label == "EDT"
+        assert result.target.tzname() == "EST"
+
     def test_invalid_iana_raises_value_error(self):
         with pytest.raises(ValueError):
             parse_time("9am Mars/Bogus", now=self.now)
