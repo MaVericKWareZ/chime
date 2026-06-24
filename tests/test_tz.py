@@ -3,7 +3,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 
-from chime.tz import TzResolutionError, is_recognized_abbrev, resolve, system_tz
+from chime.tz import (
+    AmbiguousAbbreviationError,
+    TzResolutionError,
+    is_ambiguous_abbrev,
+    is_recognized_abbrev,
+    resolve,
+    system_tz,
+)
 
 
 def test_resolve_utc_uppercase():
@@ -95,6 +102,54 @@ def test_resolve_est_is_new_york_not_fixed_offset():
     zone, label = resolve("EST")
     assert zone.key == "America/New_York"
     assert label == "EST"
+
+
+@pytest.mark.parametrize(
+    ("abbrev", "candidates"),
+    [
+        ("IST", ["Asia/Kolkata", "Europe/Dublin", "Asia/Jerusalem"]),
+        ("CST", ["America/Chicago", "Asia/Shanghai", "America/Havana"]),
+        ("BST", ["Europe/London", "Asia/Dhaka", "Pacific/Bougainville"]),
+        ("AST", ["America/Halifax", "Asia/Riyadh"]),
+    ],
+)
+def test_resolve_ambiguous_abbreviation(abbrev, candidates):
+    with pytest.raises(AmbiguousAbbreviationError) as exc:
+        resolve(abbrev)
+    assert exc.value.abbrev == abbrev
+    assert exc.value.candidates == candidates
+
+
+def test_ambiguous_error_is_tz_resolution_error():
+    assert issubclass(AmbiguousAbbreviationError, TzResolutionError)
+
+
+def test_resolve_ambiguous_case_insensitive():
+    with pytest.raises(AmbiguousAbbreviationError) as exc:
+        resolve("cst")
+    assert exc.value.abbrev == "CST"
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("ist", True),
+        ("CST", True),
+        (" bst ", True),
+        ("EDT", False),  # unambiguous — slice 02
+        ("9am", False),
+        ("America/New_York", False),
+    ],
+)
+def test_is_ambiguous_abbrev(token, expected):
+    assert is_ambiguous_abbrev(token) is expected
+
+
+def test_cdt_resolves_despite_cst_ambiguity():
+    # CST is ambiguous, but CDT is unambiguous — handled independently.
+    zone, label = resolve("CDT")
+    assert zone.key == "America/Chicago"
+    assert label == "CDT"
 
 
 def test_resolve_unrecognized_token_raises():

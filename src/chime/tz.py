@@ -11,6 +11,22 @@ class TzResolutionError(ValueError):
     """Raised when a timezone spec cannot be resolved to a single IANA zone."""
 
 
+class AmbiguousAbbreviationError(TzResolutionError):
+    """Raised when an abbreviation maps to more than one IANA zone (per ADR-0002).
+
+    Carries the offending ``abbrev`` and the ordered ``candidates`` so callers can
+    present the disambiguation list without parsing the message string.
+    """
+
+    def __init__(self, abbrev: str, candidates: list[str]) -> None:
+        self.abbrev = abbrev
+        self.candidates = candidates
+        super().__init__(
+            f"ambiguous timezone abbreviation '{abbrev}' — could be "
+            f"{', '.join(candidates)}; use the full IANA name instead"
+        )
+
+
 # Unambiguous timezone abbreviations, mapped to canonical IANA zones and treated
 # as *zone aliases* (per ADR-0002): EST and EDT both resolve to America/New_York
 # and DST comes from zoneinfo at the target moment, not the abbreviation. The
@@ -33,9 +49,23 @@ _ABBREVIATIONS = {
 }
 
 
+# Ambiguous abbreviations (per ADR-0002): each maps to several IANA zones, so
+# Chime refuses to guess and errors with the candidate list. Checked before
+# _ABBREVIATIONS and the ZoneInfo passthrough so a platform fixed-offset zone
+# named CST/IST can never silently win. Order matches the disambiguation message.
+_AMBIGUOUS = {
+    "IST": ["Asia/Kolkata", "Europe/Dublin", "Asia/Jerusalem"],
+    "CST": ["America/Chicago", "Asia/Shanghai", "America/Havana"],
+    "BST": ["Europe/London", "Asia/Dhaka", "Pacific/Bougainville"],
+    "AST": ["America/Halifax", "Asia/Riyadh"],
+}
+
+
 def resolve(spec: str) -> tuple[ZoneInfo, str]:
     spec = spec.strip()
     key = spec.upper()
+    if key in _AMBIGUOUS:
+        raise AmbiguousAbbreviationError(key, list(_AMBIGUOUS[key]))
     if key in _ABBREVIATIONS:
         return ZoneInfo(_ABBREVIATIONS[key]), key
     try:
@@ -51,6 +81,15 @@ def is_recognized_abbrev(token: str) -> bool:
     the abbreviation table itself.
     """
     return token.strip().upper() in _ABBREVIATIONS
+
+
+def is_ambiguous_abbrev(token: str) -> bool:
+    """Whether ``token`` is an ambiguous abbreviation Chime refuses to resolve.
+
+    Lets the parser route these to :func:`resolve` (which raises a structured
+    error) instead of mistaking them for unparseable time text.
+    """
+    return token.strip().upper() in _AMBIGUOUS
 
 
 def system_tz() -> tzinfo:

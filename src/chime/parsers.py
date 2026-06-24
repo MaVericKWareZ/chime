@@ -59,7 +59,7 @@ def parse_time(s: str, *, now: datetime | None = None) -> ParsedTime:
     tokens = raw.split()
     if len(tokens) >= 2:
         last = tokens[-1]
-        if _tz.is_recognized_abbrev(last) or "/" in last:
+        if _tz.is_recognized_abbrev(last) or _tz.is_ambiguous_abbrev(last) or "/" in last:
             zone, label = _tz.resolve(last)
             source_tz = zone
             source_label = label

@@ -6,6 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the 
 ## [Unreleased]
 
 ### Added
+- Ambiguous timezone abbreviations (`IST`, `CST`, `BST`, `AST`) now error at parse time with a disambiguation list of candidate IANA zones instead of silently picking one; `CDT` and other unambiguous abbreviations are unaffected.
 - Windows support: `winsound` for system sound aliases, PowerShell toast notifications (Win 10+), PowerShell SAPI for `--say`, and `subprocess.Popen` with `DETACHED_PROCESS` for `--bg`.
 - Windows added to CI test matrix.
 - `Operating System :: Microsoft :: Windows` PyPI classifier.

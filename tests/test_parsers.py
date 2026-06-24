@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from chime.parsers import ParsedTime, fmt_clock, fmt_duration, parse_duration, parse_time
+from chime.tz import AmbiguousAbbreviationError
 
 
 class TestParseDuration:
@@ -137,6 +138,17 @@ class TestParseTime:
         result = parse_time("9am EDT", now=aware_now)
         assert result.source_label == "EDT"
         assert result.target.tzname() == "EST"
+
+    def test_ambiguous_abbreviation_raises_with_candidates(self):
+        with pytest.raises(AmbiguousAbbreviationError) as exc:
+            parse_time("9am IST", now=self.now)
+        assert exc.value.candidates == ["Asia/Kolkata", "Europe/Dublin", "Asia/Jerusalem"]
+
+    def test_unambiguous_cdt_still_resolves(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am CDT", now=aware_now)
+        assert result.source_tz == ZoneInfo("America/Chicago")
+        assert result.source_label == "CDT"
 
     def test_invalid_iana_raises_value_error(self):
         with pytest.raises(ValueError):
