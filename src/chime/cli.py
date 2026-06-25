@@ -63,7 +63,7 @@ SUBCOMMANDS = {
     "_bg-runner",  # internal: invoked by spawned background process on Windows
 }
 BOOL_FLAGS = {"--bg", "--say", "--no-sound"}
-VALUE_FLAGS = {"--sound", "--repeat"}
+VALUE_FLAGS = {"--sound", "--repeat", "--tz"}
 
 
 # ---------- countdown + run ----------
@@ -214,7 +214,7 @@ def run_alarm(
 
 def cmd_at(args: argparse.Namespace) -> None:
     try:
-        parsed = parse_time(args.time)
+        parsed = parse_time(args.time, tz_flag=getattr(args, "tz", None))
     except ValueError as e:
         print(c(f"error: {e}", RED))
         sys.exit(2)
@@ -386,6 +386,7 @@ def _make_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("at", add_help=False)
     sp.add_argument("time")
     sp.add_argument("message", nargs="*")
+    sp.add_argument("--tz", dest="tz", default=None, help="source timezone (IANA name or abbrev)")
     _add_alarm_opts(sp)
     sp.set_defaults(func=cmd_at)
 
@@ -482,6 +483,10 @@ def main(argv: list[str] | None = None) -> None:
     leftover = [a for a in positional if a.startswith("--")]
     if leftover:
         print(c(f"error: unknown option {leftover[0]}", RED))
+        sys.exit(2)
+    # --tz only makes sense for `chime at`; durations are timezone-invariant.
+    if "--tz" in flags and (not positional or positional[0] != "at"):
+        print(c("error: timezone has no effect on durations", RED))
         sys.exit(2)
     if positional and positional[0] in SUBCOMMANDS:
         parser = _make_parser()

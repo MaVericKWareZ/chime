@@ -39,6 +39,11 @@ class TestSplitFlags:
         assert pos == ["10m", "tea"]
         assert flags == ["--sound", "Hero", "--bg"]
 
+    def test_tz_is_value_flag(self):
+        pos, flags = _split_flags(["10m", "--tz", "EDT"])
+        assert pos == ["10m"]
+        assert flags == ["--tz", "EDT"]
+
 
 class TestCommandSurface:
     def test_help_no_args(self):
@@ -85,6 +90,24 @@ class TestCommandSurface:
     def test_unknown_flag_exits_with_error(self):
         result = run(["--bogus", "10m"])
         assert result.returncode == 2
+
+    def test_tz_flag_collision_exits_with_error(self):
+        result = run(["at", "9am EDT", "--tz", "Europe/London", "x"])
+        assert result.returncode == 2
+        out = result.stdout + result.stderr
+        assert "conflicting timezones" in out
+        assert "EDT" in out and "Europe/London" in out
+
+    def test_tz_flag_same_zone_collision_exits_with_error(self):
+        result = run(["at", "9am EDT", "--tz", "America/New_York", "x"])
+        assert result.returncode == 2
+        assert "conflicting timezones" in (result.stdout + result.stderr)
+
+    @pytest.mark.parametrize("cmd", [["10m"], ["pomodoro"], ["stopwatch"]])
+    def test_tz_flag_on_duration_commands_errors(self, cmd):
+        result = run([*cmd, "--tz", "EDT"])
+        assert result.returncode == 2
+        assert "no effect on durations" in (result.stdout + result.stderr)
 
 
 def _fake_opts(**overrides):
@@ -143,6 +166,24 @@ class TestForegroundHeader:
             )
         )
         assert "@ 09:00 UTC" in captured["label"]
+
+    def test_cmd_at_tz_flag_shows_suffix_like_inline(self, monkeypatch):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("Asia/Kolkata"))
+        captured = _capture_label(monkeypatch)
+        cmd_at(
+            SimpleNamespace(
+                time="9am",
+                tz="EDT",
+                message=["meeting"],
+                bg=False,
+                sound=None,
+                repeat=1,
+                say=None,
+                no_sound=True,
+            )
+        )
+        # Flag form renders identically to the inline `9am EDT` form.
+        assert "@ 09:00 EDT" in captured["label"]
 
     def test_cmd_at_same_tz_no_suffix(self, monkeypatch):
         monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("America/Los_Angeles"))

@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from chime.parsers import ParsedTime, fmt_clock, fmt_duration, parse_duration, parse_time
-from chime.tz import AmbiguousAbbreviationError
+from chime.tz import AmbiguousAbbreviationError, TimezoneCollisionError, TzResolutionError
 
 
 class TestParseDuration:
@@ -162,6 +162,43 @@ class TestParseTime:
         # 14:00 IST on 13 June = 08:30 UTC on 13 June.
         # tomorrow → target should be on 14 June UTC.
         assert result.target.date().day == 14
+
+    def test_tz_flag_equivalent_to_inline(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        flag = parse_time("9am", now=aware_now, tz_flag="EDT")
+        inline = parse_time("9am EDT", now=aware_now)
+        assert flag == inline
+        assert flag.source_tz == ZoneInfo("America/New_York")
+        assert flag.source_label == "EDT"
+
+    def test_tz_flag_iana_form(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am", now=aware_now, tz_flag="America/New_York")
+        assert result.source_tz == ZoneInfo("America/New_York")
+        assert result.source_label == "America/New_York"
+
+    def test_tz_flag_and_inline_collide(self):
+        with pytest.raises(TimezoneCollisionError) as exc:
+            parse_time("9am EDT", now=self.now, tz_flag="Europe/London")
+        assert exc.value.inline == "EDT"
+        assert exc.value.flag == "Europe/London"
+
+    def test_tz_flag_and_inline_collide_even_same_zone(self):
+        # Both resolve to America/New_York, but A1 policy errors regardless.
+        with pytest.raises(TimezoneCollisionError):
+            parse_time("9am EDT", now=self.now, tz_flag="America/New_York")
+
+    def test_tz_flag_ambiguous_raises(self):
+        with pytest.raises(AmbiguousAbbreviationError) as exc:
+            parse_time("9am", now=self.now, tz_flag="IST")
+        assert exc.value.candidates == ["Asia/Kolkata", "Europe/Dublin", "Asia/Jerusalem"]
+
+    def test_tz_flag_unknown_raises(self):
+        with pytest.raises(TzResolutionError):
+            parse_time("9am", now=self.now, tz_flag="Mars/Bogus")
+
+    def test_no_tz_flag_path_unchanged(self):
+        assert parse_time("9am", now=self.now, tz_flag=None) == parse_time("9am", now=self.now)
 
     @pytest.mark.parametrize(
         "text",

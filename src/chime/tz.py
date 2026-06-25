@@ -27,6 +27,22 @@ class AmbiguousAbbreviationError(TzResolutionError):
         )
 
 
+class TimezoneCollisionError(TzResolutionError):
+    """Raised when a source timezone is given both inline and via ``--tz`` (ADR-0002,
+    policy A1) — always an error, even when both forms resolve to the same zone.
+
+    Carries the two raw ``inline`` and ``flag`` source strings so the message can
+    name both and the user can spot the conflict.
+    """
+
+    def __init__(self, inline: str, flag: str) -> None:
+        self.inline = inline
+        self.flag = flag
+        super().__init__(
+            f"conflicting timezones: inline '{inline}' and --tz '{flag}' — specify only one"
+        )
+
+
 # Unambiguous timezone abbreviations, mapped to canonical IANA zones and treated
 # as *zone aliases* (per ADR-0002): EST and EDT both resolve to America/New_York
 # and DST comes from zoneinfo at the target moment, not the abbreviation. The

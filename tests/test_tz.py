@@ -5,6 +5,7 @@ import pytest
 
 from chime.tz import (
     AmbiguousAbbreviationError,
+    TimezoneCollisionError,
     TzResolutionError,
     is_ambiguous_abbrev,
     is_recognized_abbrev,
@@ -159,6 +160,19 @@ def test_resolve_unrecognized_token_raises():
 
 def test_tz_resolution_error_is_value_error():
     assert issubclass(TzResolutionError, ValueError)
+
+
+def test_collision_error_is_tz_resolution_error():
+    assert issubclass(TimezoneCollisionError, TzResolutionError)
+
+
+def test_collision_error_carries_both_sources():
+    err = TimezoneCollisionError("EDT", "Europe/London")
+    assert err.inline == "EDT"
+    assert err.flag == "Europe/London"
+    # Message must name both sources so the user can spot the conflict.
+    assert "EDT" in str(err)
+    assert "Europe/London" in str(err)
 
 
 def test_system_tz_returns_tzinfo():
