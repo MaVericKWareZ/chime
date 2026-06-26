@@ -1,5 +1,6 @@
 """End-to-end CLI checks that don't require firing actual alarms."""
 
+import json
 import subprocess
 import sys
 from datetime import datetime
@@ -8,8 +9,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from chime import cli
-from chime.cli import _split_flags, cmd_at, run_alarm
+from chime import cli, state
+from chime.cli import _register_bg, _split_flags, cmd_at, run_alarm
 
 CHIME = [sys.executable, "-m", "chime"]
 
@@ -110,6 +111,40 @@ class TestCommandSurface:
         assert "no effect on durations" in (result.stdout + result.stderr)
 
 
+class TestRegisterBg:
+    def _isolate(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setattr(state, "is_alive", lambda _pid: True)
+
+    def test_target_is_offset_aware(self, tmp_path, monkeypatch):
+        self._isolate(tmp_path, monkeypatch)
+        _register_bg(4321, 60, "tea", "Glass", True)
+        rec = json.loads((tmp_path / "chime" / "alarms.json").read_text())[0]
+        assert datetime.fromisoformat(rec["target"]).utcoffset() is not None
+
+    def test_persists_source_fields_when_given(self, tmp_path, monkeypatch):
+        self._isolate(tmp_path, monkeypatch)
+        _register_bg(
+            4321,
+            60,
+            "mtg",
+            "Glass",
+            True,
+            source_tz="America/New_York",
+            source_label="EDT",
+        )
+        rec = json.loads((tmp_path / "chime" / "alarms.json").read_text())[0]
+        assert rec["source_tz"] == "America/New_York"
+        assert rec["source_label"] == "EDT"
+
+    def test_omits_source_fields_when_absent(self, tmp_path, monkeypatch):
+        self._isolate(tmp_path, monkeypatch)
+        _register_bg(4321, 60, "tea", "Glass", True)
+        rec = json.loads((tmp_path / "chime" / "alarms.json").read_text())[0]
+        assert "source_tz" not in rec
+        assert "source_label" not in rec
+
+
 def _fake_opts(**overrides):
     base = dict(bg=False, sound=None, repeat=1, say=None, no_sound=True)
     base.update(overrides)
@@ -127,6 +162,97 @@ def _capture_label(monkeypatch):
 
     monkeypatch.setattr(cli, "countdown", fake_countdown)
     return captured
+
+
+class TestBackgroundSourceThreading:
+    def test_run_alarm_forwards_source_fields(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(cli, "run_background", lambda *a, **k: captured.update(k))
+        run_alarm(
+            60,
+            "mtg",
+            _fake_opts(bg=True),
+            source_tz="America/New_York",
+            record_label="EDT",
+        )
+        assert captured["source_tz"] == "America/New_York"
+        assert captured["source_label"] == "EDT"  # record carries the typed label
+
+    def test_cmd_at_bg_cross_tz_persists_typed_label(self, monkeypatch):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("Asia/Kolkata"))
+        captured = {}
+        monkeypatch.setattr(cli, "run_background", lambda *a, **k: captured.update(k))
+        cmd_at(
+            SimpleNamespace(
+                time="9am EDT",
+                message=["mtg"],
+                bg=True,
+                sound=None,
+                repeat=1,
+                say=None,
+                no_sound=True,
+            )
+        )
+        assert captured["source_tz"] == "America/New_York"
+        assert captured["source_label"] == "EDT"
+
+    def test_cmd_at_bg_same_zone_omits_source_fields(self, monkeypatch):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("America/Los_Angeles"))
+        captured = {}
+        monkeypatch.setattr(cli, "run_background", lambda *a, **k: captured.update(k))
+        cmd_at(
+            SimpleNamespace(
+                time="9am America/Los_Angeles",
+                message=["x"],
+                bg=True,
+                sound=None,
+                repeat=1,
+                say=None,
+                no_sound=True,
+            )
+        )
+        assert captured.get("source_tz") is None
+        assert captured.get("source_label") is None
+
+
+class TestListSourceLabel:
+    def _seed(self, tmp_path, monkeypatch, record):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setattr(state, "is_alive", lambda _pid: True)
+        (tmp_path / "chime").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "chime" / "alarms.json").write_text(json.dumps([record]))
+
+    def test_cross_tz_alarm_shows_source_suffix(self, tmp_path, monkeypatch, capsys):
+        self._seed(
+            tmp_path,
+            monkeypatch,
+            {
+                "pid": 1,
+                "message": "meeting",
+                "target": "2099-01-01T09:30:00+05:30",
+                "source_tz": "America/New_York",
+                "source_label": "EDT",
+            },
+        )
+        cli.cmd_list(SimpleNamespace())
+        out = capsys.readouterr().out
+        assert "meeting" in out
+        assert "EDT)" in out  # source label echoed in parens
+
+    def test_same_tz_alarm_has_no_suffix_and_no_crash(self, tmp_path, monkeypatch, capsys):
+        self._seed(
+            tmp_path,
+            monkeypatch,
+            {
+                "pid": 1,
+                "message": "tea",
+                "target": "2099-01-01T09:30:00+05:30",
+            },
+        )
+        cli.cmd_list(SimpleNamespace())
+        out = capsys.readouterr().out
+        alarm_line = next(line for line in out.splitlines() if "tea" in line)
+        assert "(" not in alarm_line  # no source suffix for same-tz records
 
 
 class TestForegroundHeader:

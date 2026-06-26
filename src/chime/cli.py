@@ -13,6 +13,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from chime import __version__, alerts, state, tz
 from chime.parsers import fmt_clock, fmt_duration, parse_duration, parse_time
@@ -101,6 +102,9 @@ def run_background(
     repeat: int,
     do_say: bool,
     silent: bool,
+    *,
+    source_tz: str | None = None,
+    source_label: str | None = None,
 ) -> None:
     """Spawn a detached background process that sleeps and fires the alarm.
 
@@ -109,11 +113,28 @@ def run_background(
              the internal `_bg-runner` subcommand.
     """
     if sys.platform == "win32":
-        _run_background_windows(seconds, message, sound, repeat, do_say, silent)
+        _run_background_windows(
+            seconds,
+            message,
+            sound,
+            repeat,
+            do_say,
+            silent,
+            source_tz=source_tz,
+            source_label=source_label,
+        )
         return
     pid = os.fork()
     if pid > 0:
-        _register_bg(pid, seconds, message, sound, silent)
+        _register_bg(
+            pid,
+            seconds,
+            message,
+            sound,
+            silent,
+            source_tz=source_tz,
+            source_label=source_label,
+        )
         return
     os.setsid()
     devnull = os.open(os.devnull, os.O_RDWR)
@@ -136,6 +157,9 @@ def _run_background_windows(
     repeat: int,
     do_say: bool,
     silent: bool,
+    *,
+    source_tz: str | None = None,
+    source_label: str | None = None,
 ) -> None:
     payload = json.dumps(
         {
@@ -160,21 +184,40 @@ def _run_background_windows(
         stderr=subprocess.DEVNULL,
         close_fds=True,
     )
-    _register_bg(proc.pid, seconds, message, sound, silent)
-
-
-def _register_bg(pid: int, seconds: float, message: str | None, sound: str, silent: bool) -> None:
-    target = datetime.now() + timedelta(seconds=seconds)
-    state.add(
-        {
-            "pid": pid,
-            "message": message or "",
-            "target": target.isoformat(timespec="seconds"),
-            "started": datetime.now().isoformat(timespec="seconds"),
-            "sound": sound,
-            "silent": silent,
-        }
+    _register_bg(
+        proc.pid,
+        seconds,
+        message,
+        sound,
+        silent,
+        source_tz=source_tz,
+        source_label=source_label,
     )
+
+
+def _register_bg(
+    pid: int,
+    seconds: float,
+    message: str | None,
+    sound: str,
+    silent: bool,
+    *,
+    source_tz: str | None = None,
+    source_label: str | None = None,
+) -> None:
+    target = datetime.now(tz.system_tz()) + timedelta(seconds=seconds)
+    entry = {
+        "pid": pid,
+        "message": message or "",
+        "target": target.isoformat(timespec="seconds"),
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "sound": sound,
+        "silent": silent,
+    }
+    if source_tz is not None:
+        entry["source_tz"] = source_tz
+        entry["source_label"] = source_label
+    state.add(entry)
     print(
         c(f"⏰  alarm set for {target.strftime('%H:%M:%S')}", GREEN)
         + c(f"  (id {pid}, in {fmt_duration(seconds)})", DIM)
@@ -190,13 +233,28 @@ def run_alarm(
     opts: Any,
     target_dt: datetime | None = None,
     source_label: str | None = None,
+    source_tz: str | None = None,
+    record_label: str | None = None,
 ) -> None:
+    # `source_label` is the foreground header label (target.tzname() at the
+    # target moment); `record_label` is the user's typed token persisted to the
+    # background record. They coincide for plain abbreviations but diverge for
+    # IANA input or an off-season abbreviation, so they are tracked separately.
     if seconds <= 0:
         print(c("error: target time is in the past", RED))
         sys.exit(2)
     sound = opts.sound or alerts.DEFAULT_SOUND
     if opts.bg:
-        run_background(seconds, message, sound, opts.repeat, opts.say, opts.no_sound)
+        run_background(
+            seconds,
+            message,
+            sound,
+            opts.repeat,
+            opts.say,
+            opts.no_sound,
+            source_tz=source_tz,
+            source_label=record_label,
+        )
         return
     title = message if message else "timer"
     label = c(f"⏳  {title}", BOLD + CYAN)
@@ -220,6 +278,8 @@ def cmd_at(args: argparse.Namespace) -> None:
         sys.exit(2)
     target = parsed.target
     source_label: str | None = None
+    rec_source_tz: str | None = None
+    rec_source_label: str | None = None
     if parsed.source_tz is None:
         seconds = (target - datetime.now()).total_seconds()
     else:
@@ -229,8 +289,20 @@ def cmd_at(args: argparse.Namespace) -> None:
         sys_key = getattr(sys_tz, "key", str(sys_tz))
         if src_key != sys_key:
             source_label = target.tzname()
+            # Persist the IANA zone + the user's typed label for cross-tz
+            # background alarms so `chime list` can echo the source wall-clock.
+            rec_source_tz = src_key
+            rec_source_label = parsed.source_label
     message = " ".join(args.message) if args.message else None
-    run_alarm(seconds, message, args, target_dt=target, source_label=source_label)
+    run_alarm(
+        seconds,
+        message,
+        args,
+        target_dt=target,
+        source_label=source_label,
+        source_tz=rec_source_tz,
+        record_label=rec_source_label,
+    )
 
 
 def cmd_pomodoro(args: argparse.Namespace) -> None:
@@ -286,17 +358,21 @@ def cmd_list(args: argparse.Namespace) -> None:
         print(c("no background alarms", DIM))
         return
     print(c(f"{len(alarms)} background alarm(s):", BOLD))
-    now = datetime.now()
+    now = datetime.now(tz.system_tz())  # tz-aware: targets are offset-suffixed
     for a in alarms:
         target = datetime.fromisoformat(a["target"])
         remaining = (target - now).total_seconds()
         rem = fmt_duration(remaining) if remaining > 0 else "ringing"
         msg = a["message"] or c("(no message)", DIM)
-        print(
+        line = (
             f"  {c(str(a['pid']).rjust(6), CYAN)}  "
             f"{c(target.strftime('%a %H:%M:%S'), BOLD)}  "
             f"in {c(rem, YELLOW)}  — {msg}"
         )
+        if a.get("source_label"):
+            src_wall = target.astimezone(ZoneInfo(a["source_tz"])).strftime("%H:%M")
+            line += c(f" ({src_wall} {a['source_label']})", DIM)
+        print(line)
 
 
 def cmd_cancel(args: argparse.Namespace) -> None:

@@ -6,11 +6,15 @@ Stored as JSON under $XDG_STATE_HOME/chime/alarms.json
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from chime import tz
 
 
 def state_dir() -> Path:
@@ -32,6 +36,18 @@ def state_file() -> Path:
     return state_dir() / "alarms.json"
 
 
+def _normalize_target(value: str) -> str:
+    """Attach the system zone to a naive ISO target (lazy tz-aware migration).
+
+    Naive targets predate tz-aware persistence (ADR-0003); interpret them as
+    system-local and re-emit offset-suffixed. Already-aware targets pass through.
+    """
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz.system_tz())
+    return dt.isoformat(timespec="seconds")
+
+
 def load() -> list[dict[str, Any]]:
     f = state_file()
     if not f.exists():
@@ -40,7 +56,13 @@ def load() -> list[dict[str, Any]]:
         data = json.loads(f.read_text())
     except (json.JSONDecodeError, OSError):
         return []
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        return []
+    for rec in data:
+        # Leave malformed/missing targets untouched; load() never raises.
+        with contextlib.suppress(ValueError, TypeError, KeyError):
+            rec["target"] = _normalize_target(rec["target"])
+    return data
 
 
 def save(alarms: list[dict[str, Any]]) -> None:

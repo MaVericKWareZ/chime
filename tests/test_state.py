@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime
 
 import pytest
 
@@ -17,13 +18,60 @@ def test_load_empty_when_missing():
     assert state.load() == []
 
 
-def test_save_and_load_roundtrip():
+def test_save_and_load_roundtrip(monkeypatch):
+    # Naive targets are migrated to the system zone on load (ADR-0003); pin $TZ
+    # so the round-trip is deterministic. Non-target fields survive verbatim.
+    monkeypatch.setenv("TZ", "Asia/Kolkata")
     entries = [
         {"pid": 1234, "message": "tea", "target": "2026-06-13T15:00:00"},
         {"pid": 5678, "message": "", "target": "2026-06-13T16:00:00"},
     ]
     state.save(entries)
-    assert state.load() == entries
+    assert state.load() == [
+        {"pid": 1234, "message": "tea", "target": "2026-06-13T15:00:00+05:30"},
+        {"pid": 5678, "message": "", "target": "2026-06-13T16:00:00+05:30"},
+    ]
+
+
+def test_load_migrates_naive_target_to_system_zone(isolated_state, monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Kolkata")
+    state.state_file().write_text(
+        json.dumps([{"pid": 1, "message": "tea", "target": "2026-06-13T18:30:00"}])
+    )
+    [rec] = state.load()
+    parsed = datetime.fromisoformat(rec["target"])
+    assert parsed.utcoffset().total_seconds() == 5.5 * 3600  # +05:30
+
+
+def test_save_after_load_persists_offset_suffixed_target(isolated_state, monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Kolkata")
+    state.state_file().write_text(
+        json.dumps([{"pid": 1, "message": "tea", "target": "2026-06-13T18:30:00"}])
+    )
+    state.save(state.load())
+    on_disk = json.loads(state.state_file().read_text())[0]["target"]
+    assert on_disk == "2026-06-13T18:30:00+05:30"
+
+
+def test_source_fields_round_trip(isolated_state):
+    entry = {
+        "pid": 1,
+        "message": "standup",
+        "target": "2026-06-13T19:00:00+05:30",
+        "source_tz": "America/New_York",
+        "source_label": "EDT",
+    }
+    state.save([entry])
+    [rec] = state.load()
+    assert rec["source_tz"] == "America/New_York"
+    assert rec["source_label"] == "EDT"
+
+
+def test_same_tz_record_has_no_source_fields(isolated_state):
+    state.save([{"pid": 1, "message": "x", "target": "2026-06-13T19:00:00+05:30"}])
+    [rec] = state.load()
+    assert "source_tz" not in rec
+    assert "source_label" not in rec
 
 
 def test_state_file_lives_under_xdg_state_home(isolated_state):
