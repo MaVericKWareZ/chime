@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from chime import __version__, alerts, state, tz
+from chime import __version__, alerts, config, state, tz
 from chime.parsers import fmt_clock, fmt_duration, parse_duration, parse_time
 from chime.term import BOLD, CYAN, DIM, GREEN, MAGENTA, RED, YELLOW, c
 
@@ -60,6 +60,7 @@ SUBCOMMANDS = {
     "ls",
     "cancel",
     "sounds",
+    "config",
     "version",
     "_bg-runner",  # internal: invoked by spawned background process on Windows
 }
@@ -272,7 +273,11 @@ def run_alarm(
 
 def cmd_at(args: argparse.Namespace) -> None:
     try:
-        parsed = parse_time(args.time, tz_flag=getattr(args, "tz", None))
+        parsed = parse_time(
+            args.time,
+            tz_flag=getattr(args, "tz", None),
+            config_tz=config.get("timezone"),
+        )
     except ValueError as e:
         print(c(f"error: {e}", RED))
         sys.exit(2)
@@ -420,6 +425,78 @@ def cmd_sounds(args: argparse.Namespace) -> None:
     print(c("\npreview: chime sounds <name>", DIM))
 
 
+def _system_tz_name() -> str:
+    sys_tz = tz.system_tz()
+    return getattr(sys_tz, "key", None) or str(sys_tz)
+
+
+def _config_view() -> None:
+    # Only the timezone line is shown; preserved unknown keys stay hidden.
+    configured = config.get("timezone")
+    sys_name = _system_tz_name()
+    if configured:
+        print(f"Timezone: {configured} (overrides system: {sys_name})")
+    else:
+        print(f"Timezone: (not set — using system: {sys_name})")
+
+
+def _config_get(key: str | None) -> None:
+    if not key:
+        print(c("error: usage: chime config get <key>", RED))
+        sys.exit(2)
+    value = config.get(key)
+    if value is None:
+        sys.exit(1)  # unset → non-zero, nothing on stdout (script-friendly)
+    print(value)
+
+
+def _config_set(key: str | None, value: str | None) -> None:
+    if not key or value is None:
+        print(c("error: usage: chime config set <key> <value>", RED))
+        sys.exit(2)
+    try:
+        if key == "timezone":
+            # Resolve once for the echo; store the canonical IANA name (ADR-0002).
+            zone, label = tz.resolve(value)
+            config.set("timezone", zone.key)
+            msg = f"timezone set to {zone.key}"
+            if label != zone.key:  # abbrev typed → show it; IANA → omit the parens
+                msg += f" ({label})"
+            print(c(msg, GREEN))
+        else:
+            config.set(key, value)
+            print(c(f"{key} set to {value}", GREEN))
+    except ValueError as e:  # ConfigError (unknown key) or TzResolutionError (bad value)
+        print(c(f"error: {e}", RED))
+        sys.exit(2)
+
+
+def cmd_config(args: argparse.Namespace) -> None:
+    verb = getattr(args, "verb", None)
+    if verb is None:
+        _config_view()
+        return
+    if verb == "get":
+        _config_get(args.key)
+        return
+    if verb == "set":
+        _config_set(args.key, args.value)
+        return
+    if verb == "unset":
+        if not args.key:
+            print(c("error: usage: chime config unset <key>", RED))
+            sys.exit(2)
+        config.unset(args.key)
+        print(c(f"{args.key} unset", GREEN))
+        return
+    if verb == "reset":
+        config.reset()
+        print(c("config reset", GREEN))
+        return
+    print(c(f"error: unknown config command '{verb}'", RED))
+    sys.exit(2)
+
+
 def cmd_version(args: argparse.Namespace) -> None:
     print(f"chime {__version__}")
 
@@ -486,6 +563,12 @@ def _make_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("sounds", add_help=False)
     sp.add_argument("preview", nargs="?")
     sp.set_defaults(func=cmd_sounds)
+
+    sp = sub.add_parser("config", add_help=False)
+    sp.add_argument("verb", nargs="?")  # None | set | unset | reset | get
+    sp.add_argument("key", nargs="?")
+    sp.add_argument("value", nargs="?")
+    sp.set_defaults(func=cmd_config)
 
     sp = sub.add_parser("version", add_help=False)
     sp.set_defaults(func=cmd_version)

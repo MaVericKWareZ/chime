@@ -42,7 +42,13 @@ def parse_duration(s: str) -> float:
     return total
 
 
-def parse_time(s: str, *, now: datetime | None = None, tz_flag: str | None = None) -> ParsedTime:
+def parse_time(
+    s: str,
+    *,
+    now: datetime | None = None,
+    tz_flag: str | None = None,
+    config_tz: str | None = None,
+) -> ParsedTime:
     """Parse '15:30', '3:30pm', '9am', 'tomorrow 9am' → future datetime.
 
     An optional trailing token — an unambiguous tz abbreviation (``EDT``, ``PST``,
@@ -50,6 +56,12 @@ def parse_time(s: str, *, now: datetime | None = None, tz_flag: str | None = Non
     source timezone and resolved via :mod:`chime.tz`. The same source may instead
     be supplied as ``tz_flag`` (the raw ``--tz`` value); giving both forms is an
     error (ADR-0002, policy A1), raised before either is resolved.
+
+    ``config_tz`` is the configured-timezone fallback: it is used only when neither
+    an inline token nor ``tz_flag`` is present, so the effective-timezone chain is
+    ``inline → --tz → configured → system`` (ADR-0002). It never participates in the
+    collision check. With ``config_tz=None`` and ``tz_flag=None``, behavior is
+    byte-identical to the legacy no-tz path.
 
     Past clock times roll forward to tomorrow.
     """
@@ -73,6 +85,8 @@ def parse_time(s: str, *, now: datetime | None = None, tz_flag: str | None = Non
         source_tz, source_label = _tz.resolve(inline_token)
     elif tz_flag is not None:
         source_tz, source_label = _tz.resolve(tz_flag)
+    elif config_tz is not None:
+        source_tz, source_label = _tz.resolve(config_tz)
     s = raw.lower().replace(" ", "")
     if not s:
         raise ValueError("empty time")

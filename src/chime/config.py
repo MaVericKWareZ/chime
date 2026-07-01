@@ -18,6 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from chime import tz
 from chime.term import YELLOW, c
 
 
@@ -27,9 +28,19 @@ class ConfigError(ValueError):
 
 KNOWN_KEYS = {"timezone"}
 
-# Value validators by key; a later slice registers the timezone validator.
-# Empty here means accept-all.
-_VALIDATORS: dict[str, Callable[[str], str]] = {}
+
+def _validate_timezone(value: str) -> str:
+    """Resolve a tz spec to its canonical IANA name so config stores
+    'America/New_York', never 'EDT'. Raises ``TzResolutionError`` /
+    ``AmbiguousAbbreviationError`` (both ``ValueError``) on bad or ambiguous
+    input; ``set`` runs this before any write, so a rejected value writes nothing.
+    """
+    zone, _label = tz.resolve(value)
+    return zone.key
+
+
+# Value validators by key; a key absent here is accept-all.
+_VALIDATORS: dict[str, Callable[[str], str]] = {"timezone": _validate_timezone}
 
 
 def config_dir() -> Path:

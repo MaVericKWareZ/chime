@@ -37,6 +37,27 @@ def test_set_then_get_roundtrip():
     assert config.get("timezone") == "America/New_York"
 
 
+def test_set_timezone_stores_canonical_iana_name():
+    # An abbreviation is resolved on write and the canonical IANA zone is stored,
+    # not the typed form (ADR-0002 / PRD story 18).
+    config.set("timezone", "EDT")
+    assert config.get("timezone") == "America/New_York"
+
+
+def test_set_timezone_ambiguous_abbrev_raises_and_writes_nothing():
+    with pytest.raises(ValueError) as excinfo:
+        config.set("timezone", "IST")
+    assert "Asia/Kolkata" in str(excinfo.value)
+    assert not config.config_file().exists()
+
+
+def test_set_timezone_unknown_zone_raises_and_writes_nothing():
+    with pytest.raises(ValueError) as excinfo:
+        config.set("timezone", "Mars/Bogus")
+    assert "unknown timezone" in str(excinfo.value)
+    assert not config.config_file().exists()
+
+
 def test_unset_removes_key_but_preserves_unknown_keys():
     # An unknown key written by a future chime version must survive a mutation
     # on a different key (preserve-on-read round-trip).

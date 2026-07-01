@@ -200,6 +200,28 @@ class TestParseTime:
     def test_no_tz_flag_path_unchanged(self):
         assert parse_time("9am", now=self.now, tz_flag=None) == parse_time("9am", now=self.now)
 
+    def test_config_tz_used_when_no_inline_or_flag(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+        configured = parse_time("9am", now=aware_now, config_tz="Asia/Kolkata")
+        flag = parse_time("9am", now=aware_now, tz_flag="Asia/Kolkata")
+        assert configured == flag
+        assert configured.source_tz == ZoneInfo("Asia/Kolkata")
+
+    def test_inline_wins_over_config_tz(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am EDT", now=aware_now, config_tz="Asia/Kolkata")
+        assert result.source_tz == ZoneInfo("America/New_York")
+        assert result.source_label == "EDT"
+
+    def test_flag_wins_over_config_tz(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am", now=aware_now, tz_flag="EDT", config_tz="Asia/Kolkata")
+        assert result.source_tz == ZoneInfo("America/New_York")
+        assert result.source_label == "EDT"
+
+    def test_no_config_tz_path_unchanged(self):
+        assert parse_time("9am", now=self.now, config_tz=None) == parse_time("9am", now=self.now)
+
     @pytest.mark.parametrize(
         "text",
         ["", "abc", "25:00", "9pmm", "9:60am", "13pm", ":30", "1:2:3"],

@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from chime import cli, state
+from chime import cli, config, state
 from chime.cli import _register_bg, _split_flags, cmd_at, run_alarm
 
 CHIME = [sys.executable, "-m", "chime"]
@@ -17,6 +17,13 @@ CHIME = [sys.executable, "-m", "chime"]
 
 def run(args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(CHIME + args, capture_output=True, text=True, check=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config(tmp_path, monkeypatch):
+    """Keep every CLI test off the real user config dir — cmd_at reads
+    config.get('timezone') for the effective-tz chain."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
 
 
 class TestSplitFlags:
@@ -347,3 +354,148 @@ class TestForegroundHeader:
         out = capsys.readouterr().out
         assert "unknown timezone" in out
         assert "ZoneInfoNotFoundError" not in out
+
+
+class TestConfigCommand:
+    def test_set_timezone_stores_canonical_and_echoes(self, capsys):
+        cli.cmd_config(SimpleNamespace(verb="set", key="timezone", value="EDT"))
+        out = capsys.readouterr().out
+        assert "timezone set to America/New_York" in out
+        assert "(EDT)" in out
+        assert config.get("timezone") == "America/New_York"
+
+    def test_set_timezone_iana_form_omits_parens(self, capsys):
+        cli.cmd_config(SimpleNamespace(verb="set", key="timezone", value="Asia/Kolkata"))
+        out = capsys.readouterr().out
+        assert "timezone set to Asia/Kolkata" in out
+        assert "(" not in out  # label == canonical → no redundant parenthetical
+
+    def test_view_shows_configured_with_system(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("America/New_York"))
+        config.set("timezone", "Asia/Kolkata")
+        cli.cmd_config(SimpleNamespace(verb=None, key=None, value=None))
+        out = capsys.readouterr().out
+        assert "Timezone: Asia/Kolkata (overrides system: America/New_York)" in out
+
+    def test_view_not_set_form(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("America/New_York"))
+        cli.cmd_config(SimpleNamespace(verb=None, key=None, value=None))
+        out = capsys.readouterr().out
+        assert "Timezone: (not set — using system: America/New_York)" in out
+
+    def test_get_prints_plain_value(self, capsys):
+        config.set("timezone", "Asia/Kolkata")
+        cli.cmd_config(SimpleNamespace(verb="get", key="timezone", value=None))
+        out = capsys.readouterr().out
+        assert out == "Asia/Kolkata\n"  # no decoration, script-friendly
+
+    def test_get_unset_exits_nonzero_no_stdout(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_config(SimpleNamespace(verb="get", key="timezone", value=None))
+        assert exc.value.code != 0
+        assert capsys.readouterr().out == ""
+
+    def test_unset_removes_key(self, capsys):
+        config.set("timezone", "Asia/Kolkata")
+        cli.cmd_config(SimpleNamespace(verb="unset", key="timezone", value=None))
+        assert config.get("timezone") is None
+
+    def test_reset_wipes_file(self):
+        config.set("timezone", "Asia/Kolkata")
+        cli.cmd_config(SimpleNamespace(verb="reset", key=None, value=None))
+        assert not config.config_file().exists()
+
+    def test_set_ambiguous_errors_and_writes_nothing(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_config(SimpleNamespace(verb="set", key="timezone", value="IST"))
+        assert exc.value.code == 2
+        assert "Asia/Kolkata" in capsys.readouterr().out
+        assert config.get("timezone") is None
+
+    def test_set_unknown_zone_errors(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_config(SimpleNamespace(verb="set", key="timezone", value="Mars/Bogus"))
+        assert exc.value.code == 2
+        assert "unknown timezone" in capsys.readouterr().out
+
+    def test_set_typo_key_errors_with_hint(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_config(SimpleNamespace(verb="set", key="timezon", value="Asia/Kolkata"))
+        assert exc.value.code == 2
+        assert "did you mean 'timezone'?" in capsys.readouterr().out
+
+    def test_subcommand_dispatch_through_main(self):
+        # End-to-end through argv dispatch: set then get via subprocess
+        # (XDG_CONFIG_HOME is monkeypatched into os.environ, so the child inherits it).
+        assert run(["config", "set", "timezone", "EDT"]).returncode == 0
+        got = run(["config", "get", "timezone"])
+        assert got.returncode == 0
+        assert got.stdout.strip() == "America/New_York"
+
+
+class TestEffectiveTzChain:
+    """`chime at 9am` resolves inline → --tz → configured → system (ADR-0002)."""
+
+    def _at(self, **overrides):
+        base = dict(
+            time="9am",
+            tz=None,
+            message=["x"],
+            bg=True,
+            sound=None,
+            repeat=1,
+            say=None,
+            no_sound=True,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_configured_tz_schedules_in_that_zone_and_decorates(self, monkeypatch):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("America/New_York"))
+        config.set("timezone", "Asia/Kolkata")
+        captured = {}
+        monkeypatch.setattr(cli, "run_background", lambda *a, **k: captured.update(k))
+        cmd_at(self._at())
+        assert captured["source_tz"] == "Asia/Kolkata"  # cross-tz config → record persisted
+
+    def test_configured_same_as_system_omits_decoration(self, monkeypatch):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("America/New_York"))
+        config.set("timezone", "America/New_York")
+        captured = {}
+        monkeypatch.setattr(cli, "run_background", lambda *a, **k: captured.update(k))
+        cmd_at(self._at())
+        assert captured.get("source_tz") is None  # configured == system → byte-identical
+
+    def test_inline_overrides_configured(self, monkeypatch):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("Asia/Kolkata"))
+        config.set("timezone", "Asia/Kolkata")
+        captured = {}
+        monkeypatch.setattr(cli, "run_background", lambda *a, **k: captured.update(k))
+        cmd_at(self._at(time="9am EDT"))
+        assert captured["source_tz"] == "America/New_York"
+
+    def test_flag_overrides_configured(self, monkeypatch):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("Asia/Kolkata"))
+        config.set("timezone", "Asia/Kolkata")
+        captured = {}
+        monkeypatch.setattr(cli, "run_background", lambda *a, **k: captured.update(k))
+        cmd_at(self._at(tz="EDT"))
+        assert captured["source_tz"] == "America/New_York"
+
+    def test_configured_cross_tz_foreground_header_decorated(self, monkeypatch):
+        # Decorate decision: a configured zone that transforms the wall-clock shows
+        # its label in the countdown header, just like an explicit source tz.
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("America/New_York"))
+        config.set("timezone", "Asia/Kolkata")
+        captured = _capture_label(monkeypatch)
+        cmd_at(self._at(bg=False))
+        assert "@ 09:00 IST" in captured["label"]
+
+    def test_configured_same_tz_foreground_header_undecorated(self, monkeypatch):
+        monkeypatch.setattr(cli.tz, "system_tz", lambda: ZoneInfo("America/New_York"))
+        config.set("timezone", "America/New_York")
+        captured = _capture_label(monkeypatch)
+        cmd_at(self._at(bg=False))
+        assert "@ 09:00" in captured["label"]
+        for tzname in ("EST", "EDT", "Asia/Kolkata", "America/New_York"):
+            assert tzname not in captured["label"]
