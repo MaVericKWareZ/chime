@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 from datetime import datetime, tzinfo
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 
 class TzResolutionError(ValueError):
-    """Raised when a timezone spec cannot be resolved to a single IANA zone."""
+    """Raised when a timezone spec cannot be resolved to a single IANA zone.
+
+    ``spec`` carries the offending input on the plain unknown-timezone path so a
+    caller can feed it to :func:`suggest` without re-parsing the message. It stays
+    ``None`` on the ambiguous/collision subclasses (which carry their own data and
+    must not trigger fuzzy suggestions).
+    """
+
+    spec: str | None = None
 
 
 class AmbiguousAbbreviationError(TzResolutionError):
@@ -87,7 +96,9 @@ def resolve(spec: str) -> tuple[ZoneInfo, str]:
     try:
         return ZoneInfo(spec), spec
     except ZoneInfoNotFoundError:
-        raise TzResolutionError(f"unknown timezone: {spec}") from None
+        err = TzResolutionError(f"unknown timezone: {spec}")
+        err.spec = spec
+        raise err from None
 
 
 def is_recognized_abbrev(token: str) -> bool:
@@ -106,6 +117,29 @@ def is_ambiguous_abbrev(token: str) -> bool:
     error) instead of mistaking them for unparseable time text.
     """
     return token.strip().upper() in _AMBIGUOUS
+
+
+# Similarity threshold for suggest(). Tuned below the difflib default (0.6) so a
+# short typo like 'londn' still reaches 'europe/london' — the region prefix
+# ('europe/') dilutes the ratio — while nonsense like 'xyzzy123' still matches
+# nothing. Case-folded matching (see suggest) is what makes the city part line up.
+_SUGGEST_CUTOFF = 0.5
+
+
+def suggest(bad_spec: str) -> list[str]:
+    """Return up to three IANA zone names closest to an invalid ``bad_spec``.
+
+    Pure and case-insensitive: matches the folded input against folded zone names
+    (``difflib.get_close_matches`` is case-sensitive) and maps hits back to their
+    canonical form. Returns ``[]`` when nothing is close enough, so callers can
+    omit a "did you mean" line. No I/O beyond the in-memory tz database.
+    """
+    folded = bad_spec.strip().lower()
+    if not folded:
+        return []
+    lower_to_zone = {z.lower(): z for z in available_timezones()}
+    matches = difflib.get_close_matches(folded, lower_to_zone, n=3, cutoff=_SUGGEST_CUTOFF)
+    return [lower_to_zone[m] for m in matches]
 
 
 def system_tz() -> tzinfo:

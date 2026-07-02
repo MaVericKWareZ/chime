@@ -20,6 +20,23 @@ _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _DURATION_PATTERN = re.compile(r"(\d+(?:\.\d+)?)([smhd])")
 _BARE_NUMBER = re.compile(r"\d+(\.\d+)?")
 
+# Trailing words that belong to the time grammar, not a source timezone. A time
+# component always carries a digit, so any *other* pure-word trailing token is a
+# tz attempt — including a typo'd IANA name like 'londn' that resolve() will
+# reject with a suggestion. These keywords must stay out of that net.
+_TIME_WORDS = frozenset({"am", "pm", "a", "p", "at", "tomorrow"})
+
+
+def _looks_like_source_tz(token: str) -> bool:
+    """Whether a trailing ``token`` should be peeled off and resolved as a source
+    timezone. Recognized/ambiguous abbreviations and IANA paths qualify, as does
+    any digit-free word that isn't a time keyword (so invalid zones reach
+    :func:`chime.tz.resolve` and get a fuzzy suggestion instead of a 'bad time')."""
+    if _tz.is_recognized_abbrev(token) or _tz.is_ambiguous_abbrev(token) or "/" in token:
+        return True
+    word = token.strip().lower()
+    return word.replace("_", "").isalpha() and word not in _TIME_WORDS
+
 
 def parse_duration(s: str) -> float:
     """Parse '10m', '1h30m', '90s', '0.5h'. Bare number = minutes."""
@@ -74,7 +91,7 @@ def parse_time(
     inline_token: str | None = None
     if len(tokens) >= 2:
         last = tokens[-1]
-        if _tz.is_recognized_abbrev(last) or _tz.is_ambiguous_abbrev(last) or "/" in last:
+        if _looks_like_source_tz(last):
             inline_token = last
             raw = " ".join(tokens[:-1])
     # Collision is presence-based — raised before any resolution so the same-zone

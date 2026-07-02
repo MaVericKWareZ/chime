@@ -3,6 +3,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from chime import tz
 from chime.parsers import ParsedTime, fmt_clock, fmt_duration, parse_duration, parse_time
 from chime.tz import AmbiguousAbbreviationError, TimezoneCollisionError, TzResolutionError
 
@@ -153,6 +154,15 @@ class TestParseTime:
     def test_invalid_iana_raises_value_error(self):
         with pytest.raises(ValueError):
             parse_time("9am Mars/Bogus", now=self.now)
+
+    def test_unknown_inline_tz_surfaces_spec_for_suggestions(self):
+        # The bad token is consumed inside parse_time; it must survive on the
+        # error as .spec so the CLI can offer "did you mean" suggestions.
+        with pytest.raises(TzResolutionError) as exc:
+            parse_time("9am londn", now=self.now)
+        assert not isinstance(exc.value, AmbiguousAbbreviationError)
+        assert exc.value.spec == "londn"
+        assert "Europe/London" in tz.suggest(exc.value.spec)
 
     def test_tomorrow_prefix_with_tz(self):
         aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))

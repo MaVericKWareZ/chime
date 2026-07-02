@@ -280,6 +280,7 @@ def cmd_at(args: argparse.Namespace) -> None:
         )
     except ValueError as e:
         print(c(f"error: {e}", RED))
+        _print_tz_suggestions(e)
         sys.exit(2)
     target = parsed.target
     source_label: str | None = None
@@ -440,6 +441,20 @@ def _config_view() -> None:
         print(f"Timezone: (not set — using system: {sys_name})")
 
 
+def _print_tz_suggestions(e: ValueError) -> None:
+    """Print an indented 'did you mean' line under an unknown-timezone error.
+
+    Only a plain ``TzResolutionError`` carries a ``spec``; ambiguous/collision
+    errors (and non-tz ``ValueError``s) leave it ``None`` and get no suggestions.
+    Silent when nothing is close enough."""
+    spec = getattr(e, "spec", None)
+    if not spec:
+        return
+    matches = tz.suggest(spec)
+    if matches:
+        print(c(f"       did you mean: {', '.join(matches)}", RED))
+
+
 def _config_get(key: str | None) -> None:
     if not key:
         print(c("error: usage: chime config get <key>", RED))
@@ -468,6 +483,7 @@ def _config_set(key: str | None, value: str | None) -> None:
             print(c(f"{key} set to {value}", GREEN))
     except ValueError as e:  # ConfigError (unknown key) or TzResolutionError (bad value)
         print(c(f"error: {e}", RED))
+        _print_tz_suggestions(e)
         sys.exit(2)
 
 

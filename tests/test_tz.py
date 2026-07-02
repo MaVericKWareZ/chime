@@ -10,6 +10,7 @@ from chime.tz import (
     is_ambiguous_abbrev,
     is_recognized_abbrev,
     resolve,
+    suggest,
     system_tz,
 )
 
@@ -158,6 +159,14 @@ def test_resolve_unrecognized_token_raises():
         resolve("FOO")
 
 
+def test_unknown_timezone_error_carries_spec():
+    # The offending spec is exposed structurally so callers can feed it to
+    # suggest() without re-parsing the message string.
+    with pytest.raises(TzResolutionError) as exc:
+        resolve("Mars/Bogus")
+    assert exc.value.spec == "Mars/Bogus"
+
+
 def test_tz_resolution_error_is_value_error():
     assert issubclass(TzResolutionError, ValueError)
 
@@ -173,6 +182,27 @@ def test_collision_error_carries_both_sources():
     # Message must name both sources so the user can spot the conflict.
     assert "EDT" in str(err)
     assert "Europe/London" in str(err)
+
+
+@pytest.mark.parametrize(
+    ("bad_spec", "expected"),
+    [
+        ("londn", "Europe/London"),
+        ("kolkta", "Asia/Kolkata"),
+        ("new_york", "America/New_York"),
+    ],
+)
+def test_suggest_returns_close_iana_name(bad_spec, expected):
+    assert expected in suggest(bad_spec)
+
+
+def test_suggest_no_close_match_returns_empty():
+    assert suggest("xyzzy123") == []
+
+
+@pytest.mark.parametrize("bad_spec", ["londn", "kolkta", "new_york", "e", "a/b"])
+def test_suggest_returns_at_most_three(bad_spec):
+    assert len(suggest(bad_spec)) <= 3
 
 
 def test_system_tz_returns_tzinfo():

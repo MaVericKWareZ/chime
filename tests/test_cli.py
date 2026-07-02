@@ -355,6 +355,25 @@ class TestForegroundHeader:
         assert "unknown timezone" in out
         assert "ZoneInfoNotFoundError" not in out
 
+    def test_cmd_at_typo_inline_tz_suggests_iana_names(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cmd_at(
+                SimpleNamespace(
+                    time="9am londn",
+                    message=["x"],
+                    bg=False,
+                    sound=None,
+                    repeat=1,
+                    say=None,
+                    no_sound=True,
+                )
+            )
+        assert exc.value.code == 2
+        out = capsys.readouterr().out
+        assert "unknown timezone" in out
+        assert "did you mean:" in out
+        assert "Europe/London" in out
+
 
 class TestConfigCommand:
     def test_set_timezone_stores_canonical_and_echoes(self, capsys):
@@ -417,6 +436,31 @@ class TestConfigCommand:
             cli.cmd_config(SimpleNamespace(verb="set", key="timezone", value="Mars/Bogus"))
         assert exc.value.code == 2
         assert "unknown timezone" in capsys.readouterr().out
+
+    def test_set_typo_zone_suggests_iana_names(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_config(SimpleNamespace(verb="set", key="timezone", value="londn"))
+        assert exc.value.code == 2
+        out = capsys.readouterr().out
+        assert "unknown timezone" in out
+        assert "did you mean:" in out
+        assert "Europe/London" in out
+        assert config.get("timezone") is None  # rejected value writes nothing
+
+    def test_set_far_zone_omits_suggestion_line(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_config(SimpleNamespace(verb="set", key="timezone", value="xyzzy123"))
+        assert exc.value.code == 2
+        out = capsys.readouterr().out
+        assert "unknown timezone" in out
+        assert "did you mean" not in out
+
+    def test_set_ambiguous_has_no_suggestion_line(self, capsys):
+        # IST already carries a disambiguation list — it must not also get a
+        # fuzzy "did you mean" line.
+        with pytest.raises(SystemExit):
+            cli.cmd_config(SimpleNamespace(verb="set", key="timezone", value="IST"))
+        assert "did you mean" not in capsys.readouterr().out
 
     def test_set_typo_key_errors_with_hint(self, capsys):
         with pytest.raises(SystemExit) as exc:
