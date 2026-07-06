@@ -24,12 +24,18 @@ USAGE = """chime — friendly terminal alarms, timers & pomodoro
 Usage:
   chime <duration> [message]       Timer (e.g., 10m, 1h30m, 90s, 0.5h)
   chime at <time> [message]        Alarm at clock time (15:30, 3:30pm, 9am)
+                                   Time may carry a timezone: at "9am EDT"
   chime pomodoro [work] [brk] [rounds]
                                    Pomodoro cycles (default 25 5 4)
   chime stopwatch                  Count-up timer
   chime list                       List background alarms
   chime cancel <id|all>            Cancel a background alarm
   chime sounds [name]              List/preview alarm sounds
+  chime config [key]               Show config (or one key's value)
+  chime config set <key> <value>   Set a config value (e.g. timezone)
+  chime config get <key>           Print one value (script-friendly)
+  chime config unset <key>         Clear one key
+  chime config reset               Wipe the whole config
   chime version                    Print version
   chime help                       Show this help
 
@@ -37,13 +43,24 @@ Options:
   --bg                             Run alarm in background, return immediately
   --sound NAME                     Alert sound (default: Glass)
   --repeat N                       Repeat sound N times (default: 3)
+  --tz ZONE                        Source timezone for the alarm (e.g. EDT,
+                                   Asia/Kolkata); can't combine with inline tz
   --say                            Speak the message aloud
   --no-sound                       Silent — notification only
+
+Timezones:
+  Alarms accept a source timezone inline ("9am EDT") or via --tz. Unambiguous
+  abbreviations and full IANA names work; ambiguous ones (IST, CST, BST, AST)
+  error with candidates. Set a default with: chime config set timezone <zone>.
+  See the README's Timezones section for the full policy.
 
 Examples:
   chime 10m "tea is ready"
   chime 1h30m
   chime at 9:30am standup
+  chime at "9am EDT" standup
+  chime at 9am --tz Asia/Kolkata
+  chime config set timezone Asia/Kolkata
   chime --bg 25m focus
   chime pomodoro
   chime pomodoro 50 10 3
