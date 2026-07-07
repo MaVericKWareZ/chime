@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-07
+
 ### Added
 - Timezone-aware alarms: `chime at` accepts a source timezone inline (`chime at "9am EDT" standup`) or via a new `--tz` flag (`chime at 9am --tz Asia/Kolkata`). Unambiguous abbreviations (`EST`/`EDT`, `PST`/`PDT`, `CDT`, `MST`/`MDT`, `JST`, `KST`, `AEST`/`AEDT`, `GMT`/`UTC`) resolve as zone aliases to a single IANA zone, with DST applied by `zoneinfo` at the target moment; full IANA names always work. The countdown header and `chime list` show the source-timezone label only when it differs from local, so same-timezone usage is unchanged.
 - Ambiguous timezone abbreviations (`IST`, `CST`, `BST`, `AST`) now error at parse time with a disambiguation list of candidate IANA zones instead of silently picking one; `CDT` and other unambiguous abbreviations are unaffected.
@@ -35,5 +37,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the 
 - Linux desktop notifications + sound via `notify-send` / `paplay` / `aplay`.
 - Optional spoken alerts via `say` / `spd-say` / `espeak`.
 
-[Unreleased]: https://github.com/MaVericKWareZ/chime/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MaVericKWareZ/chime/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MaVericKWareZ/chime/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MaVericKWareZ/chime/releases/tag/v0.1.0
