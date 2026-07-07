@@ -9,7 +9,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
 
-A no-fuss CLI for the things you actually use timers for: a quick countdown, an alarm at 3pm, and pomodoro rounds when you need to focus. Zero runtime dependencies — just the Python standard library.
+A no-fuss CLI for the things you actually use timers for: a quick countdown, an alarm at 3pm, and pomodoro rounds when you need to focus. Zero runtime dependencies on macOS and Linux — just the Python standard library (Windows adds one: `tzdata`, for the timezone database it lacks).
 
 ```text
 $ chime 10m "tea is ready"
@@ -30,7 +30,7 @@ $ chime 10m "tea is ready"
 - Background alarms (`--bg`) that survive shell exit, with `list` / `cancel`
 - Native desktop notifications + system sounds on macOS, Linux, and Windows
 - Optional spoken alerts (`--say`)
-- Zero runtime dependencies — just the Python standard library
+- Zero runtime dependencies on macOS and Linux — just the Python standard library (Windows adds `tzdata`)
 
 ## Install
 
@@ -162,6 +162,8 @@ Abbreviations are resolved to their IANA name when you set them (`chime config s
 | Windows | PowerShell toast (Win 10+) | `winsound` (stdlib) | PowerShell SAPI |
 
 Linux users typically already have these tools; on a fresh system: `sudo apt install libnotify-bin pulseaudio-utils` (Debian / Ubuntu) gets you notifications + sound.
+
+Windows has no system IANA timezone database, so the install pulls in `tzdata` (the only runtime dependency, and only on Windows) to power the timezone features. macOS and Linux read zones from the OS and install nothing extra.
 
 ## Background alarms
 

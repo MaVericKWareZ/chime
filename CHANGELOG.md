@@ -14,6 +14,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the 
 - Windows support: `winsound` for system sound aliases, PowerShell toast notifications (Win 10+), PowerShell SAPI for `--say`, and `subprocess.Popen` with `DETACHED_PROCESS` for `--bg`.
 - Windows added to CI test matrix.
 - `Operating System :: Microsoft :: Windows` PyPI classifier.
+- `tzdata` as a runtime dependency on Windows only (via a `platform_system == 'Windows'` environment marker), so `zoneinfo` can resolve IANA zones on a platform that ships no system timezone database. macOS and Linux stay dependency-free.
 
 ### Changed
 - Background alarm records now store `target` as a timezone-aware, offset-suffixed ISO timestamp (plus optional `source_tz` / `source_label` for cross-timezone alarms). Existing `alarms.json` files with naive timestamps are migrated silently and automatically on the first save after upgrade — no `chime migrate` step, and pending alarms keep firing correctly.

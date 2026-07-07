@@ -4,7 +4,7 @@ Guide for AI coding agents working in this repo. Keep changes small, focused, an
 
 ## Project
 
-`chime-cli` — a zero-dependency Python CLI for timers, clock-time alarms, and pomodoro sessions. Targets macOS, Linux, and Windows. Requires Python >=3.10. Uses only the standard library at runtime.
+`chime-cli` — a Python CLI for timers, clock-time alarms, and pomodoro sessions. Targets macOS, Linux, and Windows. Requires Python >=3.10. Uses only the standard library at runtime on macOS and Linux; on Windows it also depends on `tzdata` (which ships the IANA timezone database that platform lacks).
 
 ## Layout
 
@@ -23,7 +23,9 @@ Guide for AI coding agents working in this repo. Keep changes small, focused, an
 
 - Pure logic → `parsers.py`. OS side effects → `alerts.py` or `state.py`. argparse + printing → `cli.py`. Do not blur these boundaries.
 - Cross-platform support in `alerts.py` is keyed on `sys.platform`. When adding a backend, extend `notify()`, `play_sound()`, `speak()`, and `list_sounds()` together.
-- Keep the runtime dependency list empty. Anything new must come from the stdlib.
+- Keep the runtime dependency list empty on macOS and Linux — anything new there must come from the stdlib. The sole exception is `tzdata`, scoped to Windows via a `platform_system == 'Windows'` marker, because that platform ships no IANA timezone database. Adding any other dependency (or broadening this one) needs an explicit decision.
+- Don't commit the docs/ folder unless specifically asked. Even then, ask for the exact files to commit.
+- Don't add a co-author to the commit. Always use the user's email to make the commits.
 
 ## Dev commands
 
