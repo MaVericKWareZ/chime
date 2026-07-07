@@ -4,10 +4,38 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta
+from typing import NamedTuple
+from zoneinfo import ZoneInfo
+
+from chime import tz as _tz
+
+
+class ParsedTime(NamedTuple):
+    target: datetime
+    source_tz: ZoneInfo | None
+    source_label: str | None
+
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _DURATION_PATTERN = re.compile(r"(\d+(?:\.\d+)?)([smhd])")
 _BARE_NUMBER = re.compile(r"\d+(\.\d+)?")
+
+# Trailing words that belong to the time grammar, not a source timezone. A time
+# component always carries a digit, so any *other* pure-word trailing token is a
+# tz attempt — including a typo'd IANA name like 'londn' that resolve() will
+# reject with a suggestion. These keywords must stay out of that net.
+_TIME_WORDS = frozenset({"am", "pm", "a", "p", "at", "tomorrow"})
+
+
+def _looks_like_source_tz(token: str) -> bool:
+    """Whether a trailing ``token`` should be peeled off and resolved as a source
+    timezone. Recognized/ambiguous abbreviations and IANA paths qualify, as does
+    any digit-free word that isn't a time keyword (so invalid zones reach
+    :func:`chime.tz.resolve` and get a fuzzy suggestion instead of a 'bad time')."""
+    if _tz.is_recognized_abbrev(token) or _tz.is_ambiguous_abbrev(token) or "/" in token:
+        return True
+    word = token.strip().lower()
+    return word.replace("_", "").isalpha() and word not in _TIME_WORDS
 
 
 def parse_duration(s: str) -> float:
@@ -31,15 +59,54 @@ def parse_duration(s: str) -> float:
     return total
 
 
-def parse_time(s: str, *, now: datetime | None = None) -> datetime:
+def parse_time(
+    s: str,
+    *,
+    now: datetime | None = None,
+    tz_flag: str | None = None,
+    config_tz: str | None = None,
+) -> ParsedTime:
     """Parse '15:30', '3:30pm', '9am', 'tomorrow 9am' → future datetime.
+
+    An optional trailing token — an unambiguous tz abbreviation (``EDT``, ``PST``,
+    ``GMT``, …) or any token containing ``/`` (an IANA name) — is interpreted as a
+    source timezone and resolved via :mod:`chime.tz`. The same source may instead
+    be supplied as ``tz_flag`` (the raw ``--tz`` value); giving both forms is an
+    error (ADR-0002, policy A1), raised before either is resolved.
+
+    ``config_tz`` is the configured-timezone fallback: it is used only when neither
+    an inline token nor ``tz_flag`` is present, so the effective-timezone chain is
+    ``inline → --tz → configured → system`` (ADR-0002). It never participates in the
+    collision check. With ``config_tz=None`` and ``tz_flag=None``, behavior is
+    byte-identical to the legacy no-tz path.
 
     Past clock times roll forward to tomorrow.
     """
-    s = s.strip().lower().replace(" ", "")
+    raw = s.strip()
+    if not raw:
+        raise ValueError("empty time")
+    source_tz: ZoneInfo | None = None
+    source_label: str | None = None
+    tokens = raw.split()
+    inline_token: str | None = None
+    if len(tokens) >= 2:
+        last = tokens[-1]
+        if _looks_like_source_tz(last):
+            inline_token = last
+            raw = " ".join(tokens[:-1])
+    # Collision is presence-based — raised before any resolution so the same-zone
+    # and bad-flag cases error deterministically (ADR-0002 A1).
+    if inline_token is not None and tz_flag is not None:
+        raise _tz.TimezoneCollisionError(inline_token, tz_flag)
+    if inline_token is not None:
+        source_tz, source_label = _tz.resolve(inline_token)
+    elif tz_flag is not None:
+        source_tz, source_label = _tz.resolve(tz_flag)
+    elif config_tz is not None:
+        source_tz, source_label = _tz.resolve(config_tz)
+    s = raw.lower().replace(" ", "")
     if not s:
         raise ValueError("empty time")
-    now = now or datetime.now()
     days_ahead = 0
     if s.startswith("tomorrow"):
         days_ahead = 1
@@ -70,11 +137,25 @@ def parse_time(s: str, *, now: datetime | None = None) -> datetime:
             hour = 0
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         raise ValueError(f"invalid time: {hour:02d}:{minute:02d}")
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if source_tz is None:
+        now = now or datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        target += timedelta(days=days_ahead)
+        if days_ahead == 0 and target <= now:
+            target += timedelta(days=1)
+        return ParsedTime(target, None, None)
+    # Source-tz path: interpret the wall-clock in the source zone.
+    if now is None:
+        now_in_source = datetime.now(tz=source_tz)
+    elif now.tzinfo is None:
+        now_in_source = now.replace(tzinfo=source_tz)
+    else:
+        now_in_source = now.astimezone(source_tz)
+    target = now_in_source.replace(hour=hour, minute=minute, second=0, microsecond=0)
     target += timedelta(days=days_ahead)
-    if days_ahead == 0 and target <= now:
+    if days_ahead == 0 and target <= now_in_source:
         target += timedelta(days=1)
-    return target
+    return ParsedTime(target, source_tz, source_label)
 
 
 def fmt_duration(sec: float) -> str:

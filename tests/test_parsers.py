@@ -1,8 +1,11 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from chime.parsers import fmt_clock, fmt_duration, parse_duration, parse_time
+from chime import tz
+from chime.parsers import ParsedTime, fmt_clock, fmt_duration, parse_duration, parse_time
+from chime.tz import AmbiguousAbbreviationError, TimezoneCollisionError, TzResolutionError
 
 
 class TestParseDuration:
@@ -54,20 +57,23 @@ class TestParseTime:
     )
     def test_valid_times(self, text, hour, minute, day_offset):
         result = parse_time(text, now=self.now)
-        assert result.hour == hour
-        assert result.minute == minute
-        assert (result.date() - self.now.date()).days == day_offset
+        assert isinstance(result, ParsedTime)
+        assert result.target.hour == hour
+        assert result.target.minute == minute
+        assert (result.target.date() - self.now.date()).days == day_offset
+        assert result.source_tz is None
+        assert result.source_label is None
 
     def test_tomorrow_prefix(self):
         result = parse_time("tomorrow 9am", now=self.now)
-        assert result.hour == 9
-        assert (result.date() - self.now.date()).days == 1
+        assert result.target.hour == 9
+        assert (result.target.date() - self.now.date()).days == 1
 
     def test_tomorrow_at_prefix(self):
         result = parse_time("tomorrow at 15:30", now=self.now)
-        assert result.hour == 15
-        assert result.minute == 30
-        assert (result.date() - self.now.date()).days == 1
+        assert result.target.hour == 15
+        assert result.target.minute == 30
+        assert (result.target.date() - self.now.date()).days == 1
 
     def test_case_insensitive(self):
         assert parse_time("3:30PM", now=self.now) == parse_time("3:30pm", now=self.now)
@@ -77,7 +83,154 @@ class TestParseTime:
 
     def test_target_is_future(self):
         result = parse_time("9am", now=self.now)
-        assert result > self.now
+        assert result.target > self.now
+
+    def test_no_tz_path_returns_naive_target(self):
+        result = parse_time("9am", now=self.now)
+        assert result.target.tzinfo is None
+        assert result.source_tz is None
+        assert result.source_label is None
+
+    def test_trailing_utc_token(self):
+        # 14:00 IST = 08:30 UTC, so 9am UTC is still ahead today.
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am UTC", now=aware_now)
+        assert result.source_tz == ZoneInfo("UTC")
+        assert result.source_label == "UTC"
+        assert result.target.tzinfo == ZoneInfo("UTC")
+        assert result.target.hour == 9
+        assert result.target.minute == 0
+
+    def test_trailing_iana_token(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am America/New_York", now=aware_now)
+        assert result.source_tz == ZoneInfo("America/New_York")
+        assert result.source_label == "America/New_York"
+        assert result.target.tzinfo == ZoneInfo("America/New_York")
+        assert result.target.hour == 9
+        # June → EDT, the resolved tzname at the target moment
+        assert result.target.tzname() == "EDT"
+
+    def test_trailing_abbreviation_token(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am EDT", now=aware_now)
+        assert result.source_tz == ZoneInfo("America/New_York")
+        assert result.source_label == "EDT"
+        assert result.target.tzinfo.key == "America/New_York"
+        assert result.target.hour == 9
+
+    @pytest.mark.parametrize("text", ["9am pst", "9am Edt", "9am eDt"])
+    def test_trailing_abbreviation_case_insensitive(self, text):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time(text, now=aware_now)
+        assert result.source_tz is not None
+        assert result.target.tzinfo is not None
+
+    def test_abbreviation_dst_flip_summer(self):
+        # EST typed against a June `now` resolves to a wall-clock that is actually
+        # EDT at the target moment — the abbreviation is an alias, not an offset.
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am EST", now=aware_now)
+        assert result.source_label == "EST"
+        assert result.target.tzname() == "EDT"
+
+    def test_abbreviation_dst_flip_winter(self):
+        aware_now = datetime(2026, 1, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am EDT", now=aware_now)
+        assert result.source_label == "EDT"
+        assert result.target.tzname() == "EST"
+
+    def test_ambiguous_abbreviation_raises_with_candidates(self):
+        with pytest.raises(AmbiguousAbbreviationError) as exc:
+            parse_time("9am IST", now=self.now)
+        assert exc.value.candidates == ["Asia/Kolkata", "Europe/Dublin", "Asia/Jerusalem"]
+
+    def test_unambiguous_cdt_still_resolves(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am CDT", now=aware_now)
+        assert result.source_tz == ZoneInfo("America/Chicago")
+        assert result.source_label == "CDT"
+
+    def test_invalid_iana_raises_value_error(self):
+        with pytest.raises(ValueError):
+            parse_time("9am Mars/Bogus", now=self.now)
+
+    def test_unknown_inline_tz_surfaces_spec_for_suggestions(self):
+        # The bad token is consumed inside parse_time; it must survive on the
+        # error as .spec so the CLI can offer "did you mean" suggestions.
+        with pytest.raises(TzResolutionError) as exc:
+            parse_time("9am londn", now=self.now)
+        assert not isinstance(exc.value, AmbiguousAbbreviationError)
+        assert exc.value.spec == "londn"
+        assert "Europe/London" in tz.suggest(exc.value.spec)
+
+    def test_tomorrow_prefix_with_tz(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("tomorrow 9am UTC", now=aware_now)
+        assert result.source_tz == ZoneInfo("UTC")
+        assert result.target.hour == 9
+        # 14:00 IST on 13 June = 08:30 UTC on 13 June.
+        # tomorrow → target should be on 14 June UTC.
+        assert result.target.date().day == 14
+
+    def test_tz_flag_equivalent_to_inline(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        flag = parse_time("9am", now=aware_now, tz_flag="EDT")
+        inline = parse_time("9am EDT", now=aware_now)
+        assert flag == inline
+        assert flag.source_tz == ZoneInfo("America/New_York")
+        assert flag.source_label == "EDT"
+
+    def test_tz_flag_iana_form(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am", now=aware_now, tz_flag="America/New_York")
+        assert result.source_tz == ZoneInfo("America/New_York")
+        assert result.source_label == "America/New_York"
+
+    def test_tz_flag_and_inline_collide(self):
+        with pytest.raises(TimezoneCollisionError) as exc:
+            parse_time("9am EDT", now=self.now, tz_flag="Europe/London")
+        assert exc.value.inline == "EDT"
+        assert exc.value.flag == "Europe/London"
+
+    def test_tz_flag_and_inline_collide_even_same_zone(self):
+        # Both resolve to America/New_York, but A1 policy errors regardless.
+        with pytest.raises(TimezoneCollisionError):
+            parse_time("9am EDT", now=self.now, tz_flag="America/New_York")
+
+    def test_tz_flag_ambiguous_raises(self):
+        with pytest.raises(AmbiguousAbbreviationError) as exc:
+            parse_time("9am", now=self.now, tz_flag="IST")
+        assert exc.value.candidates == ["Asia/Kolkata", "Europe/Dublin", "Asia/Jerusalem"]
+
+    def test_tz_flag_unknown_raises(self):
+        with pytest.raises(TzResolutionError):
+            parse_time("9am", now=self.now, tz_flag="Mars/Bogus")
+
+    def test_no_tz_flag_path_unchanged(self):
+        assert parse_time("9am", now=self.now, tz_flag=None) == parse_time("9am", now=self.now)
+
+    def test_config_tz_used_when_no_inline_or_flag(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+        configured = parse_time("9am", now=aware_now, config_tz="Asia/Kolkata")
+        flag = parse_time("9am", now=aware_now, tz_flag="Asia/Kolkata")
+        assert configured == flag
+        assert configured.source_tz == ZoneInfo("Asia/Kolkata")
+
+    def test_inline_wins_over_config_tz(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am EDT", now=aware_now, config_tz="Asia/Kolkata")
+        assert result.source_tz == ZoneInfo("America/New_York")
+        assert result.source_label == "EDT"
+
+    def test_flag_wins_over_config_tz(self):
+        aware_now = datetime(2026, 6, 13, 14, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        result = parse_time("9am", now=aware_now, tz_flag="EDT", config_tz="Asia/Kolkata")
+        assert result.source_tz == ZoneInfo("America/New_York")
+        assert result.source_label == "EDT"
+
+    def test_no_config_tz_path_unchanged(self):
+        assert parse_time("9am", now=self.now, config_tz=None) == parse_time("9am", now=self.now)
 
     @pytest.mark.parametrize(
         "text",

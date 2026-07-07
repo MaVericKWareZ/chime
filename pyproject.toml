@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "chime-cli"
 dynamic = ["version"]
-description = "Friendly terminal alarms, timers & pomodoro for macOS and Linux"
+description = "Friendly terminal alarms, timers & pomodoro for macOS, Linux, and Windows"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -27,7 +27,11 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Utilities",
 ]
-dependencies = []
+# Windows ships no system IANA tz database, so zoneinfo needs the tzdata PyPI
+# package there. macOS/Linux resolve zones from the OS and stay dependency-free.
+dependencies = [
+    "tzdata; platform_system == 'Windows'",
+]
 
 [project.scripts]
 chime = "chime.cli:main"

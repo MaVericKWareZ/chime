@@ -13,8 +13,9 @@ import sys
 import time
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from chime import __version__, alerts, state
+from chime import __version__, alerts, config, state, tz
 from chime.parsers import fmt_clock, fmt_duration, parse_duration, parse_time
 from chime.term import BOLD, CYAN, DIM, GREEN, MAGENTA, RED, YELLOW, c
 
@@ -23,12 +24,18 @@ USAGE = """chime — friendly terminal alarms, timers & pomodoro
 Usage:
   chime <duration> [message]       Timer (e.g., 10m, 1h30m, 90s, 0.5h)
   chime at <time> [message]        Alarm at clock time (15:30, 3:30pm, 9am)
+                                   Time may carry a timezone: at "9am EDT"
   chime pomodoro [work] [brk] [rounds]
                                    Pomodoro cycles (default 25 5 4)
   chime stopwatch                  Count-up timer
   chime list                       List background alarms
   chime cancel <id|all>            Cancel a background alarm
   chime sounds [name]              List/preview alarm sounds
+  chime config [key]               Show config (or one key's value)
+  chime config set <key> <value>   Set a config value (e.g. timezone)
+  chime config get <key>           Print one value (script-friendly)
+  chime config unset <key>         Clear one key
+  chime config reset               Wipe the whole config
   chime version                    Print version
   chime help                       Show this help
 
@@ -36,13 +43,24 @@ Options:
   --bg                             Run alarm in background, return immediately
   --sound NAME                     Alert sound (default: Glass)
   --repeat N                       Repeat sound N times (default: 3)
+  --tz ZONE                        Source timezone for the alarm (e.g. EDT,
+                                   Asia/Kolkata); can't combine with inline tz
   --say                            Speak the message aloud
   --no-sound                       Silent — notification only
+
+Timezones:
+  Alarms accept a source timezone inline ("9am EDT") or via --tz. Unambiguous
+  abbreviations and full IANA names work; ambiguous ones (IST, CST, BST, AST)
+  error with candidates. Set a default with: chime config set timezone <zone>.
+  See the README's Timezones section for the full policy.
 
 Examples:
   chime 10m "tea is ready"
   chime 1h30m
   chime at 9:30am standup
+  chime at "9am EDT" standup
+  chime at 9am --tz Asia/Kolkata
+  chime config set timezone Asia/Kolkata
   chime --bg 25m focus
   chime pomodoro
   chime pomodoro 50 10 3
@@ -59,11 +77,12 @@ SUBCOMMANDS = {
     "ls",
     "cancel",
     "sounds",
+    "config",
     "version",
     "_bg-runner",  # internal: invoked by spawned background process on Windows
 }
 BOOL_FLAGS = {"--bg", "--say", "--no-sound"}
-VALUE_FLAGS = {"--sound", "--repeat"}
+VALUE_FLAGS = {"--sound", "--repeat", "--tz"}
 
 
 # ---------- countdown + run ----------
@@ -101,6 +120,9 @@ def run_background(
     repeat: int,
     do_say: bool,
     silent: bool,
+    *,
+    source_tz: str | None = None,
+    source_label: str | None = None,
 ) -> None:
     """Spawn a detached background process that sleeps and fires the alarm.
 
@@ -109,11 +131,28 @@ def run_background(
              the internal `_bg-runner` subcommand.
     """
     if sys.platform == "win32":
-        _run_background_windows(seconds, message, sound, repeat, do_say, silent)
+        _run_background_windows(
+            seconds,
+            message,
+            sound,
+            repeat,
+            do_say,
+            silent,
+            source_tz=source_tz,
+            source_label=source_label,
+        )
         return
     pid = os.fork()
     if pid > 0:
-        _register_bg(pid, seconds, message, sound, silent)
+        _register_bg(
+            pid,
+            seconds,
+            message,
+            sound,
+            silent,
+            source_tz=source_tz,
+            source_label=source_label,
+        )
         return
     os.setsid()
     devnull = os.open(os.devnull, os.O_RDWR)
@@ -136,6 +175,9 @@ def _run_background_windows(
     repeat: int,
     do_say: bool,
     silent: bool,
+    *,
+    source_tz: str | None = None,
+    source_label: str | None = None,
 ) -> None:
     payload = json.dumps(
         {
@@ -160,21 +202,40 @@ def _run_background_windows(
         stderr=subprocess.DEVNULL,
         close_fds=True,
     )
-    _register_bg(proc.pid, seconds, message, sound, silent)
-
-
-def _register_bg(pid: int, seconds: float, message: str | None, sound: str, silent: bool) -> None:
-    target = datetime.now() + timedelta(seconds=seconds)
-    state.add(
-        {
-            "pid": pid,
-            "message": message or "",
-            "target": target.isoformat(timespec="seconds"),
-            "started": datetime.now().isoformat(timespec="seconds"),
-            "sound": sound,
-            "silent": silent,
-        }
+    _register_bg(
+        proc.pid,
+        seconds,
+        message,
+        sound,
+        silent,
+        source_tz=source_tz,
+        source_label=source_label,
     )
+
+
+def _register_bg(
+    pid: int,
+    seconds: float,
+    message: str | None,
+    sound: str,
+    silent: bool,
+    *,
+    source_tz: str | None = None,
+    source_label: str | None = None,
+) -> None:
+    target = datetime.now(tz.system_tz()) + timedelta(seconds=seconds)
+    entry = {
+        "pid": pid,
+        "message": message or "",
+        "target": target.isoformat(timespec="seconds"),
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "sound": sound,
+        "silent": silent,
+    }
+    if source_tz is not None:
+        entry["source_tz"] = source_tz
+        entry["source_label"] = source_label
+    state.add(entry)
     print(
         c(f"⏰  alarm set for {target.strftime('%H:%M:%S')}", GREEN)
         + c(f"  (id {pid}, in {fmt_duration(seconds)})", DIM)
@@ -185,19 +246,41 @@ def _register_bg(pid: int, seconds: float, message: str | None, sound: str, sile
 
 
 def run_alarm(
-    seconds: float, message: str | None, opts: Any, target_dt: datetime | None = None
+    seconds: float,
+    message: str | None,
+    opts: Any,
+    target_dt: datetime | None = None,
+    source_label: str | None = None,
+    source_tz: str | None = None,
+    record_label: str | None = None,
 ) -> None:
+    # `source_label` is the foreground header label (target.tzname() at the
+    # target moment); `record_label` is the user's typed token persisted to the
+    # background record. They coincide for plain abbreviations but diverge for
+    # IANA input or an off-season abbreviation, so they are tracked separately.
     if seconds <= 0:
         print(c("error: target time is in the past", RED))
         sys.exit(2)
     sound = opts.sound or alerts.DEFAULT_SOUND
     if opts.bg:
-        run_background(seconds, message, sound, opts.repeat, opts.say, opts.no_sound)
+        run_background(
+            seconds,
+            message,
+            sound,
+            opts.repeat,
+            opts.say,
+            opts.no_sound,
+            source_tz=source_tz,
+            source_label=record_label,
+        )
         return
     title = message if message else "timer"
     label = c(f"⏳  {title}", BOLD + CYAN)
     if target_dt is not None:
-        label += c(f"  @ {target_dt.strftime('%H:%M')}", DIM)
+        suffix = f"  @ {target_dt.strftime('%H:%M')}"
+        if source_label is not None:
+            suffix += f" {source_label}"
+        label += c(suffix, DIM)
     if countdown(seconds, label=label):
         alerts.trigger(message, sound, opts.repeat, opts.say, opts.no_sound)
 
@@ -207,13 +290,42 @@ def run_alarm(
 
 def cmd_at(args: argparse.Namespace) -> None:
     try:
-        target = parse_time(args.time)
+        parsed = parse_time(
+            args.time,
+            tz_flag=getattr(args, "tz", None),
+            config_tz=config.get("timezone"),
+        )
     except ValueError as e:
         print(c(f"error: {e}", RED))
+        _print_tz_suggestions(e)
         sys.exit(2)
-    seconds = (target - datetime.now()).total_seconds()
+    target = parsed.target
+    source_label: str | None = None
+    rec_source_tz: str | None = None
+    rec_source_label: str | None = None
+    if parsed.source_tz is None:
+        seconds = (target - datetime.now()).total_seconds()
+    else:
+        sys_tz = tz.system_tz()
+        seconds = (target - datetime.now(tz=sys_tz)).total_seconds()
+        src_key = getattr(parsed.source_tz, "key", str(parsed.source_tz))
+        sys_key = getattr(sys_tz, "key", str(sys_tz))
+        if src_key != sys_key:
+            source_label = target.tzname()
+            # Persist the IANA zone + the user's typed label for cross-tz
+            # background alarms so `chime list` can echo the source wall-clock.
+            rec_source_tz = src_key
+            rec_source_label = parsed.source_label
     message = " ".join(args.message) if args.message else None
-    run_alarm(seconds, message, args, target_dt=target)
+    run_alarm(
+        seconds,
+        message,
+        args,
+        target_dt=target,
+        source_label=source_label,
+        source_tz=rec_source_tz,
+        record_label=rec_source_label,
+    )
 
 
 def cmd_pomodoro(args: argparse.Namespace) -> None:
@@ -269,17 +381,21 @@ def cmd_list(args: argparse.Namespace) -> None:
         print(c("no background alarms", DIM))
         return
     print(c(f"{len(alarms)} background alarm(s):", BOLD))
-    now = datetime.now()
+    now = datetime.now(tz.system_tz())  # tz-aware: targets are offset-suffixed
     for a in alarms:
         target = datetime.fromisoformat(a["target"])
         remaining = (target - now).total_seconds()
         rem = fmt_duration(remaining) if remaining > 0 else "ringing"
         msg = a["message"] or c("(no message)", DIM)
-        print(
+        line = (
             f"  {c(str(a['pid']).rjust(6), CYAN)}  "
             f"{c(target.strftime('%a %H:%M:%S'), BOLD)}  "
             f"in {c(rem, YELLOW)}  — {msg}"
         )
+        if a.get("source_label"):
+            src_wall = target.astimezone(ZoneInfo(a["source_tz"])).strftime("%H:%M")
+            line += c(f" ({src_wall} {a['source_label']})", DIM)
+        print(line)
 
 
 def cmd_cancel(args: argparse.Namespace) -> None:
@@ -327,6 +443,93 @@ def cmd_sounds(args: argparse.Namespace) -> None:
     print(c("\npreview: chime sounds <name>", DIM))
 
 
+def _system_tz_name() -> str:
+    sys_tz = tz.system_tz()
+    return getattr(sys_tz, "key", None) or str(sys_tz)
+
+
+def _config_view() -> None:
+    # Only the timezone line is shown; preserved unknown keys stay hidden.
+    configured = config.get("timezone")
+    sys_name = _system_tz_name()
+    if configured:
+        print(f"Timezone: {configured} (overrides system: {sys_name})")
+    else:
+        print(f"Timezone: (not set — using system: {sys_name})")
+
+
+def _print_tz_suggestions(e: ValueError) -> None:
+    """Print an indented 'did you mean' line under an unknown-timezone error.
+
+    Only a plain ``TzResolutionError`` carries a ``spec``; ambiguous/collision
+    errors (and non-tz ``ValueError``s) leave it ``None`` and get no suggestions.
+    Silent when nothing is close enough."""
+    spec = getattr(e, "spec", None)
+    if not spec:
+        return
+    matches = tz.suggest(spec)
+    if matches:
+        print(c(f"       did you mean: {', '.join(matches)}", RED))
+
+
+def _config_get(key: str | None) -> None:
+    if not key:
+        print(c("error: usage: chime config get <key>", RED))
+        sys.exit(2)
+    value = config.get(key)
+    if value is None:
+        sys.exit(1)  # unset → non-zero, nothing on stdout (script-friendly)
+    print(value)
+
+
+def _config_set(key: str | None, value: str | None) -> None:
+    if not key or value is None:
+        print(c("error: usage: chime config set <key> <value>", RED))
+        sys.exit(2)
+    try:
+        if key == "timezone":
+            # Resolve once for the echo; store the canonical IANA name (ADR-0002).
+            zone, label = tz.resolve(value)
+            config.set("timezone", zone.key)
+            msg = f"timezone set to {zone.key}"
+            if label != zone.key:  # abbrev typed → show it; IANA → omit the parens
+                msg += f" ({label})"
+            print(c(msg, GREEN))
+        else:
+            config.set(key, value)
+            print(c(f"{key} set to {value}", GREEN))
+    except ValueError as e:  # ConfigError (unknown key) or TzResolutionError (bad value)
+        print(c(f"error: {e}", RED))
+        _print_tz_suggestions(e)
+        sys.exit(2)
+
+
+def cmd_config(args: argparse.Namespace) -> None:
+    verb = getattr(args, "verb", None)
+    if verb is None:
+        _config_view()
+        return
+    if verb == "get":
+        _config_get(args.key)
+        return
+    if verb == "set":
+        _config_set(args.key, args.value)
+        return
+    if verb == "unset":
+        if not args.key:
+            print(c("error: usage: chime config unset <key>", RED))
+            sys.exit(2)
+        config.unset(args.key)
+        print(c(f"{args.key} unset", GREEN))
+        return
+    if verb == "reset":
+        config.reset()
+        print(c("config reset", GREEN))
+        return
+    print(c(f"error: unknown config command '{verb}'", RED))
+    sys.exit(2)
+
+
 def cmd_version(args: argparse.Namespace) -> None:
     print(f"chime {__version__}")
 
@@ -369,6 +572,7 @@ def _make_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("at", add_help=False)
     sp.add_argument("time")
     sp.add_argument("message", nargs="*")
+    sp.add_argument("--tz", dest="tz", default=None, help="source timezone (IANA name or abbrev)")
     _add_alarm_opts(sp)
     sp.set_defaults(func=cmd_at)
 
@@ -392,6 +596,12 @@ def _make_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("sounds", add_help=False)
     sp.add_argument("preview", nargs="?")
     sp.set_defaults(func=cmd_sounds)
+
+    sp = sub.add_parser("config", add_help=False)
+    sp.add_argument("verb", nargs="?")  # None | set | unset | reset | get
+    sp.add_argument("key", nargs="?")
+    sp.add_argument("value", nargs="?")
+    sp.set_defaults(func=cmd_config)
 
     sp = sub.add_parser("version", add_help=False)
     sp.set_defaults(func=cmd_version)
@@ -465,6 +675,10 @@ def main(argv: list[str] | None = None) -> None:
     leftover = [a for a in positional if a.startswith("--")]
     if leftover:
         print(c(f"error: unknown option {leftover[0]}", RED))
+        sys.exit(2)
+    # --tz only makes sense for `chime at`; durations are timezone-invariant.
+    if "--tz" in flags and (not positional or positional[0] != "at"):
+        print(c("error: timezone has no effect on durations", RED))
         sys.exit(2)
     if positional and positional[0] in SUBCOMMANDS:
         parser = _make_parser()
