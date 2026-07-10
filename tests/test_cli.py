@@ -602,3 +602,13 @@ class TestWhen:
         with pytest.raises(SystemExit):
             cli.main(["when", "make", "--verbose"])
         assert captured["argv"] == ["make", "--verbose"]
+
+    def test_aborted_suppresses_alert_and_exits_130(self, monkeypatch):
+        def fake_run(argv, **kwargs):
+            return cli.run.CompletionResult(" ".join(argv), "aborted", 130, 1.0)
+
+        monkeypatch.setattr(cli.run, "run", fake_run)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "sleep", "100"])
+        assert exc.value.code == 130
+        assert self.delivered == []

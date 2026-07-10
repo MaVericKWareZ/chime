@@ -546,6 +546,10 @@ def cmd_when(raw: list[str]) -> None:
     sound, say, no_sound, repeat = _read_sound_opts(opts)
 
     result = run.run(command)
+    if result.outcome == "aborted":
+        # A Chime-caught interrupt (your Ctrl-C): the child was already reaped;
+        # fire no alert and exit 130 (never a Completion notification).
+        sys.exit(130)
     line = run.render_line(result)
     print(line)
     message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body

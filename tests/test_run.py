@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+import chime.run as run_mod
 from chime.run import (
     CompletionResult,
     exit_status,
@@ -36,6 +37,13 @@ def test_outcome_passed_on_zero():
 def test_outcome_failed_on_nonzero():
     assert outcome_for(2) == "failed"
     assert outcome_for(139) == "failed"
+
+
+def test_outcome_aborted_when_interrupted():
+    # A Chime-caught interrupt is `aborted` regardless of the child's exit code.
+    assert outcome_for(130, was_interrupted=True) == "aborted"
+    assert outcome_for(0, was_interrupted=True) == "aborted"
+    assert outcome_for(139, was_interrupted=True) == "aborted"
 
 
 # ---------- exit-code mapping ----------
@@ -85,6 +93,18 @@ def test_render_line_shows_command_exit_and_elapsed():
     assert render_line(result) == "🔔  `make test` finished — exit 0 (4m 12s)"
 
 
+def test_render_line_names_signal_on_posix(monkeypatch):
+    monkeypatch.setattr(run_mod.sys, "platform", "linux")
+    result = CompletionResult("make test", "failed", 139, 123.0)  # 128 + 11
+    assert render_line(result) == "🔔  `make test` killed by SIGSEGV (2m 03s)"
+
+
+def test_render_line_degrades_on_windows(monkeypatch):
+    monkeypatch.setattr(run_mod.sys, "platform", "win32")
+    result = CompletionResult("make test", "failed", 139, 123.0)
+    assert render_line(result) == "🔔  `make test` exited abnormally (code 139) (2m 03s)"
+
+
 # ---------- run(): thin, portable e2e ----------
 
 
@@ -106,6 +126,35 @@ def test_run_command_not_found_is_127():
     result = run(["definitely-not-a-real-command-xyz"])
     assert result.exit_code == 127
     assert result.outcome == "failed"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX live signals")
+def test_run_foreign_sigsegv_is_failed():
+    # A signal Chime did NOT catch is a real (failed) completion → 128 + signum.
+    result = run(_py("import os, signal; os.kill(os.getpid(), signal.SIGSEGV)"))
+    assert result.outcome == "failed"
+    assert result.exit_code == 139  # 128 + 11
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX live signals")
+def test_run_foreign_sigint_is_failed_not_aborted():
+    # A SIGINT death Chime did not catch (targets only the child) is `failed`,
+    # never `aborted` — the distinguishing factor is who caught the interrupt.
+    result = run(_py("import os, signal; os.kill(os.getpid(), signal.SIGINT)"))
+    assert result.outcome == "failed"
+    assert result.exit_code == 130  # 128 + 2
+
+
+def test_run_aborted_on_keyboard_interrupt(monkeypatch):
+    # A Chime-caught interrupt (Ctrl-C reaches the child via the shared console)
+    # surfaces as `aborted`, exiting 130 — no dependence on real signals.
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(run_mod.subprocess, "run", interrupt)
+    result = run(["sleep", "100"])
+    assert result.outcome == "aborted"
+    assert result.exit_code == 130
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX exec permissions")
