@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from chime import __version__, alerts, config, run, state, tz
+from chime import __version__, alerts, config, run, state, tz, watch
 from chime.parsers import fmt_clock, fmt_duration, parse_duration, parse_time
 from chime.term import BOLD, CYAN, DIM, GREEN, MAGENTA, RED, YELLOW, c
 
@@ -610,6 +610,60 @@ def cmd_monitor(raw: list[str]) -> None:
     sys.exit(0)
 
 
+def cmd_watch(raw: list[str]) -> None:
+    """`chime watch "<command>" <pattern>` — poll a command and alert on a match."""
+    pos, flags = _split_named_flags(
+        raw,
+        bool_flags={"--say", "--no-sound"},
+        value_flags={"--sound", "--repeat", "--until", "--interval"},
+    )
+    if not pos:
+        print(c("error: chime watch needs a command", RED))
+        print(c('       try: chime watch "curl -s localhost:8080/health" --until UP', DIM))
+        sys.exit(2)
+    command = pos[0]
+
+    # The predicate is set by `--until <pattern>` or a single bare positional —
+    # the two forms are identical; supplying both (or neither) is an error.
+    from_flag = flags[flags.index("--until") + 1] if "--until" in flags else None
+    from_pos = pos[1] if len(pos) > 1 else None
+    if from_flag is not None and from_pos is not None:
+        print(c("error: give the match pattern once — --until X or a bare X, not both", RED))
+        sys.exit(2)
+    predicate = from_flag if from_flag is not None else from_pos
+    if predicate is None:
+        print(c("error: chime watch needs a match pattern (--until X or a bare X)", RED))
+        sys.exit(2)
+
+    interval = 5.0
+    if "--interval" in flags:
+        raw_interval = flags[flags.index("--interval") + 1]
+        try:
+            interval = parse_duration(raw_interval)
+        except ValueError:
+            print(c(f"error: '{raw_interval}' is not a valid interval", RED))
+            sys.exit(2)
+    sound, say, no_sound, repeat = _read_sound_opts(flags)
+
+    try:
+        result = watch.poll(command, predicate, interval=interval)
+    except KeyboardInterrupt:
+        # A mid-poll Ctrl-C: mirror `when`/`monitor` — fire nothing, exit 130.
+        sys.exit(130)
+    line = watch.render_line(result)
+    print(line)
+    message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
+    alerts.deliver(
+        "chime",
+        message,
+        sound=sound or alerts.DEFAULT_SOUND,
+        repeat=repeat,
+        do_say=say,
+        silent=no_sound,
+    )
+    sys.exit(0)  # matched → 0
+
+
 def cmd_version(args: argparse.Namespace) -> None:
     print(f"chime {__version__}")
 
@@ -716,6 +770,40 @@ def _split_flags(argv: list[str]) -> tuple[list[str], list[str]]:
     return pos, flags
 
 
+def _split_named_flags(
+    argv: list[str], *, bool_flags: set[str], value_flags: set[str]
+) -> tuple[list[str], list[str]]:
+    """Flags-anywhere split of `argv` into (positional, flags) for a given grammar.
+
+    Like `_split_flags` but parameterized by the flag sets, so `chime watch` can
+    carry its own options (`--until`, `--interval`) without polluting the global
+    timer grammar. Unlike `run.split_argv`, positionals do not start an opaque
+    tail — flags may follow the command (`watch "curl …" --until UP`). Exits 2 on
+    an unknown option or a value flag missing its value.
+    """
+    pos: list[str] = []
+    flags: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in bool_flags:
+            flags.append(a)
+            i += 1
+        elif a in value_flags:
+            if i + 1 >= len(argv):
+                print(c(f"error: {a} needs a value", RED))
+                sys.exit(2)
+            flags.extend([a, argv[i + 1]])
+            i += 2
+        elif a.startswith("--"):
+            print(c(f"error: unknown option {a}", RED))
+            sys.exit(2)
+        else:
+            pos.append(a)
+            i += 1
+    return pos, flags
+
+
 def _read_sound_opts(flags: list[str]) -> tuple[str | None, bool, bool, int]:
     """Read the shared alert flags (--sound/--say/--no-sound/--repeat) → tuple.
 
@@ -752,13 +840,12 @@ def _bare_duration(positional: list[str], flags: list[str]) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = sys.argv[1:] if argv is None else argv
-    # `when` wraps an opaque command whose own flags must not be parsed by chime,
-    # so it is routed before the global help/version scan and `_split_flags`.
-    if args and args[0] == "when":
-        cmd_when(args[1:])
-        return
-    if args and args[0] == "monitor":
-        cmd_monitor(args[1:])
+    # The process-monitoring subcommands carry their own argv grammar (opaque
+    # wrapped commands, or flags like --until/--interval) that the global
+    # help/version scan and `_split_flags` would mangle, so they route first.
+    monitoring = {"when": cmd_when, "monitor": cmd_monitor, "watch": cmd_watch}
+    if args and args[0] in monitoring:
+        monitoring[args[0]](args[1:])
         return
     if not args or any(a in ("help", "-h", "--help") for a in args):
         print(USAGE)
