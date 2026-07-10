@@ -574,6 +574,42 @@ def cmd_when(raw: list[str]) -> None:
     sys.exit(result.exit_code)
 
 
+def cmd_monitor(raw: list[str]) -> None:
+    """`… | chime monitor [label]` — tee a stream and alert when the pipe closes."""
+    if "--only-fail" in raw or "--only-pass" in raw:
+        # A pipe carries no exit status, so there is nothing for the firing
+        # filters to test — reject rather than silently ignore them.
+        print(c("error: --only-fail/--only-pass need an exit code; a pipe has none", RED))
+        sys.exit(2)
+    try:
+        opts, rest = run.split_argv(
+            raw, bool_flags={"--say", "--no-sound"}, value_flags={"--sound", "--repeat"}
+        )
+    except ValueError as e:
+        print(c(f"error: {e} (use -- to pass flags to the command)", RED))
+        sys.exit(2)
+    label = " ".join(rest)
+    sound, say, no_sound, repeat = _read_sound_opts(opts)
+
+    try:
+        result = run.monitor(sys.stdin.buffer, sys.stdout.buffer, label)
+    except KeyboardInterrupt:
+        # A mid-stream Ctrl-C: mirror `when`'s aborted path — fire nothing.
+        sys.exit(130)
+    line = run.render_line(result)
+    print(line)
+    message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
+    alerts.deliver(
+        "chime",
+        message,
+        sound=sound or alerts.DEFAULT_SOUND,
+        repeat=repeat,
+        do_say=say,
+        silent=no_sound,
+    )
+    sys.exit(0)
+
+
 def cmd_version(args: argparse.Namespace) -> None:
     print(f"chime {__version__}")
 
@@ -720,6 +756,9 @@ def main(argv: list[str] | None = None) -> None:
     # so it is routed before the global help/version scan and `_split_flags`.
     if args and args[0] == "when":
         cmd_when(args[1:])
+        return
+    if args and args[0] == "monitor":
+        cmd_monitor(args[1:])
         return
     if not args or any(a in ("help", "-h", "--help") for a in args):
         print(USAGE)

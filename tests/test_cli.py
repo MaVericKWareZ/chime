@@ -664,3 +664,59 @@ class TestWhen:
             cli.main(["when", "--only-pass", "sleep", "100"])
         assert exc.value.code == 130
         assert self.delivered == []
+
+
+class TestMonitor:
+    """`… | chime monitor` — pipe-form Completion notifications (process-monitoring 04)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_alert(self, monkeypatch):
+        self.delivered = []
+        monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: self.delivered.append((a, k)))
+
+    def _fake_monitor(self, monkeypatch, label_box=None):
+        def fake(stdin_buf, stdout_buf, label):
+            if label_box is not None:
+                label_box["label"] = label
+            return cli.run.CompletionResult(label, "ended", None, 1.0)
+
+        monkeypatch.setattr(cli.run, "monitor", fake)
+
+    def test_fires_on_eof_and_exits_zero(self, monkeypatch, capsys):
+        self._fake_monitor(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["monitor"])
+        assert exc.value.code == 0
+        assert len(self.delivered) == 1
+        assert self.delivered[0][0][1].startswith("stream ended")
+        assert capsys.readouterr().out.startswith("🔔  stream ended")
+
+    def test_label_reaches_the_alert(self, monkeypatch):
+        box = {}
+        self._fake_monitor(monkeypatch, label_box=box)
+        with pytest.raises(SystemExit):
+            cli.main(["monitor", "refactor auth"])
+        assert box["label"] == "refactor auth"
+        assert self.delivered[0][0][1] == "`refactor auth` stream ended (1s)"
+
+    def test_sound_flag_consumed_by_chime(self, monkeypatch):
+        box = {}
+        self._fake_monitor(monkeypatch, label_box=box)
+        with pytest.raises(SystemExit):
+            cli.main(["monitor", "--sound", "Glass", "refactor auth"])
+        assert box["label"] == "refactor auth"  # flag not swallowed into the label
+        assert self.delivered[0][1]["sound"] == "Glass"
+
+    def test_only_fail_errors(self, monkeypatch):
+        self._fake_monitor(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["monitor", "--only-fail"])
+        assert exc.value.code == 2
+        assert self.delivered == []
+
+    def test_only_pass_errors(self, monkeypatch):
+        self._fake_monitor(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["monitor", "--only-pass"])
+        assert exc.value.code == 2
+        assert self.delivered == []

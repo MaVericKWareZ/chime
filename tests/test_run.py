@@ -1,5 +1,6 @@
 """Unit + thin-e2e checks for the `chime.run` completion-notification module."""
 
+import io
 import sys
 
 import pytest
@@ -8,6 +9,7 @@ import chime.run as run_mod
 from chime.run import (
     CompletionResult,
     exit_status,
+    monitor,
     outcome_for,
     render_line,
     run,
@@ -130,6 +132,38 @@ def test_render_line_degrades_on_windows(monkeypatch):
     monkeypatch.setattr(run_mod.sys, "platform", "win32")
     result = CompletionResult("make test", "failed", 139, 123.0)
     assert render_line(result) == "🔔  `make test` exited abnormally (code 139) (2m 03s)"
+
+
+def test_render_line_ended_without_label():
+    result = CompletionResult("", "ended", None, 252.0)
+    assert render_line(result) == "🔔  stream ended (4m 12s)"
+
+
+def test_render_line_ended_with_label():
+    result = CompletionResult("refactor auth", "ended", None, 252.0)
+    assert render_line(result) == "🔔  `refactor auth` stream ended (4m 12s)"
+
+
+# ---------- monitor: byte-faithful pipe tee ----------
+
+
+def test_monitor_tees_bytes_faithfully_and_reports_ended():
+    payload = b"plain\ntext\x1b[31mred\x1b[0m\xff\x00\x89PNG binary"
+    stdout = io.BytesIO()
+    result = monitor(io.BytesIO(payload), stdout, "refactor auth")
+    assert stdout.getvalue() == payload  # byte-for-byte, no line-buffer corruption
+    assert result.outcome == "ended"
+    assert result.exit_code is None
+    assert result.command == "refactor auth"
+
+
+def test_monitor_empty_stream_still_ends():
+    stdout = io.BytesIO()
+    result = monitor(io.BytesIO(b""), stdout, "")
+    assert stdout.getvalue() == b""
+    assert result.outcome == "ended"
+    assert result.exit_code is None
+    assert result.elapsed >= 0
 
 
 # ---------- run(): thin, portable e2e ----------

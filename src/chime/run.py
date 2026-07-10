@@ -97,8 +97,14 @@ def split_argv(
 
 def render_line(result: CompletionResult) -> str:
     """The plain default completion line (ADR-0004: one line, no banner)."""
+    duration = fmt_duration(result.elapsed)
+    if result.outcome == "ended":
+        # Pipe form (`chime monitor`): no exit code, an optional label fills the
+        # command slot. Bare stream → drop the backticked slot entirely.
+        label = f"`{result.command}` " if result.command else ""
+        return f"🔔  {label}stream ended ({duration})"
     detail = _completion_detail(result.exit_code)
-    return f"🔔  `{result.command}` {detail} ({fmt_duration(result.elapsed)})"
+    return f"🔔  `{result.command}` {detail} ({duration})"
 
 
 def _completion_detail(exit_code: int | None) -> str:
@@ -148,3 +154,22 @@ def run(argv: list[str]) -> CompletionResult:
         exit_code = exit_status(completed.returncode)
     elapsed = time.monotonic() - start
     return CompletionResult(command, outcome_for(exit_code, was_interrupted), exit_code, elapsed)
+
+
+def monitor(stdin_buf, stdout_buf, label: str) -> CompletionResult:
+    """Tee `stdin_buf`→`stdout_buf` byte-faithfully, firing when the pipe closes.
+
+    The pipe form of a Completion notification (`producer | chime monitor`):
+    the producer's bytes pass through untouched — binary and colored output are
+    copied in fixed-size chunks (never text-mode, never line-buffered) — and the
+    trigger is EOF (the producer exited). A pipe carries no exit status, so the
+    outcome is `ended` with `exit_code` absent; the optional `label` fills the
+    command slot for display. Timed from this call, mirroring `run`.
+    """
+    start = time.monotonic()
+    read = getattr(stdin_buf, "read1", stdin_buf.read)
+    while chunk := read(65536):
+        stdout_buf.write(chunk)
+        stdout_buf.flush()
+    elapsed = time.monotonic() - start
+    return CompletionResult(label, "ended", None, elapsed)
