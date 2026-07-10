@@ -40,6 +40,21 @@ def outcome_for(exit_code: int, was_interrupted: bool = False) -> str:
     return "passed" if exit_code == 0 else "failed"
 
 
+def should_fire(outcome: str, only: str | None) -> bool:
+    """Whether a Completion notification should fire, given a firing filter.
+
+    `--only-fail` (``only="fail"``) fires only on a `failed` completion;
+    `--only-pass` (``only="pass"``) only on a `passed` one; bare `chime when`
+    (``only=None``) fires on any completion. An `aborted` run (your Ctrl-C)
+    never fires regardless — the exit code is still propagated by the caller.
+    """
+    if outcome == "aborted":
+        return False
+    if only is None:
+        return True
+    return (only == "fail" and outcome == "failed") or (only == "pass" and outcome == "passed")
+
+
 def exit_status(returncode: int) -> int:
     """Map a subprocess return code to chime's own exit status.
 
@@ -104,14 +119,15 @@ def _completion_detail(exit_code: int | None) -> str:
     return f"finished — exit {exit_code}"
 
 
-def run(argv: list[str], *, only: str | None = None) -> CompletionResult:
+def run(argv: list[str]) -> CompletionResult:
     """Run `argv` as a foreground child, timing it, and report how it ended.
 
     Stdio is inherited (not captured), so the child's colors, progress bars and
     interactive prompts behave exactly as if it were unwrapped. Chime never
     kills the child (ADR-0005); it waits for the process to exit on its own.
 
-    ``only`` is accepted for interface stability but unused until slice 03.
+    The firing decision (`--only-fail`/`--only-pass`) lives in the CLI, which
+    consults `should_fire` once this result is known — `run` only observes.
     """
     command = " ".join(argv)
     start = time.monotonic()

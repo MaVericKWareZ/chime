@@ -612,3 +612,55 @@ class TestWhen:
             cli.main(["when", "sleep", "100"])
         assert exc.value.code == 130
         assert self.delivered == []
+
+    # --- firing filters: --only-fail / --only-pass (process-monitoring 03) ---
+
+    def _fake_result(self, monkeypatch, outcome, exit_code):
+        monkeypatch.setattr(
+            cli.run,
+            "run",
+            lambda argv, **k: cli.run.CompletionResult(" ".join(argv), outcome, exit_code, 1.0),
+        )
+
+    def test_only_fail_suppresses_on_pass(self, monkeypatch, capsys):
+        self._fake_result(monkeypatch, "passed", 0)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-fail", "make", "test"])
+        assert exc.value.code == 0  # child code still propagated
+        assert self.delivered == []  # no alert
+        assert capsys.readouterr().out == ""  # no 🔔 line either
+
+    def test_only_fail_fires_on_failure(self, monkeypatch):
+        self._fake_result(monkeypatch, "failed", 2)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-fail", "make", "test"])
+        assert exc.value.code == 2
+        assert len(self.delivered) == 1
+
+    def test_only_pass_fires_on_success(self, monkeypatch):
+        self._fake_result(monkeypatch, "passed", 0)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-pass", "make", "test"])
+        assert exc.value.code == 0
+        assert len(self.delivered) == 1
+
+    def test_only_pass_suppresses_on_failure(self, monkeypatch, capsys):
+        self._fake_result(monkeypatch, "failed", 2)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-pass", "make", "test"])
+        assert exc.value.code == 2  # child code still propagated
+        assert self.delivered == []
+        assert capsys.readouterr().out == ""
+
+    def test_both_only_flags_error(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-fail", "--only-pass", "make", "test"])
+        assert exc.value.code == 2
+        assert self.delivered == []
+
+    def test_aborted_never_fires_even_under_only_pass(self, monkeypatch):
+        self._fake_result(monkeypatch, "aborted", 130)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-pass", "sleep", "100"])
+        assert exc.value.code == 130
+        assert self.delivered == []

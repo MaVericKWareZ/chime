@@ -11,6 +11,7 @@ from chime.run import (
     outcome_for,
     render_line,
     run,
+    should_fire,
     split_argv,
 )
 
@@ -44,6 +45,32 @@ def test_outcome_aborted_when_interrupted():
     assert outcome_for(130, was_interrupted=True) == "aborted"
     assert outcome_for(0, was_interrupted=True) == "aborted"
     assert outcome_for(139, was_interrupted=True) == "aborted"
+
+
+# ---------- firing filter (--only-fail / --only-pass) ----------
+
+
+def test_should_fire_no_filter_fires_on_pass_and_fail():
+    # Bare `chime when` (only=None) fires on any completion.
+    assert should_fire("passed", None) is True
+    assert should_fire("failed", None) is True
+
+
+def test_should_fire_only_fail():
+    assert should_fire("failed", "fail") is True
+    assert should_fire("passed", "fail") is False
+
+
+def test_should_fire_only_pass():
+    assert should_fire("passed", "pass") is True
+    assert should_fire("failed", "pass") is False
+
+
+def test_should_fire_aborted_never_fires():
+    # An aborted run (Ctrl-C) never fires, whatever the filter.
+    assert should_fire("aborted", None) is False
+    assert should_fire("aborted", "fail") is False
+    assert should_fire("aborted", "pass") is False
 
 
 # ---------- exit-code mapping ----------

@@ -534,7 +534,9 @@ def cmd_when(raw: list[str]) -> None:
     """`chime when <command>` — run a command and alert when it exits."""
     try:
         opts, command = run.split_argv(
-            raw, bool_flags={"--say", "--no-sound"}, value_flags={"--sound", "--repeat"}
+            raw,
+            bool_flags={"--say", "--no-sound", "--only-fail", "--only-pass"},
+            value_flags={"--sound", "--repeat"},
         )
     except ValueError as e:
         print(c(f"error: {e} (use -- to pass flags to the command)", RED))
@@ -543,6 +545,10 @@ def cmd_when(raw: list[str]) -> None:
         print(c("error: chime when needs a command", RED))
         print(c("       try: chime when make test", DIM))
         sys.exit(2)
+    if "--only-fail" in opts and "--only-pass" in opts:
+        print(c("error: --only-fail and --only-pass are mutually exclusive", RED))
+        sys.exit(2)
+    only = "fail" if "--only-fail" in opts else "pass" if "--only-pass" in opts else None
     sound, say, no_sound, repeat = _read_sound_opts(opts)
 
     result = run.run(command)
@@ -550,6 +556,10 @@ def cmd_when(raw: list[str]) -> None:
         # A Chime-caught interrupt (your Ctrl-C): the child was already reaped;
         # fire no alert and exit 130 (never a Completion notification).
         sys.exit(130)
+    if not run.should_fire(result.outcome, only):
+        # A firing filter (--only-fail/--only-pass) suppressed this outcome:
+        # stay fully silent (no line, no alert) but still propagate the code.
+        sys.exit(result.exit_code)
     line = run.render_line(result)
     print(line)
     message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
