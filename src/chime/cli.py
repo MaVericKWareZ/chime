@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from chime import __version__, alerts, config, state, tz
+from chime import __version__, alerts, config, run, state, tz
 from chime.parsers import fmt_clock, fmt_duration, parse_duration, parse_time
 from chime.term import BOLD, CYAN, DIM, GREEN, MAGENTA, RED, YELLOW, c
 
@@ -530,6 +530,36 @@ def cmd_config(args: argparse.Namespace) -> None:
     sys.exit(2)
 
 
+def cmd_when(raw: list[str]) -> None:
+    """`chime when <command>` — run a command and alert when it exits."""
+    try:
+        opts, command = run.split_argv(
+            raw, bool_flags={"--say", "--no-sound"}, value_flags={"--sound", "--repeat"}
+        )
+    except ValueError as e:
+        print(c(f"error: {e} (use -- to pass flags to the command)", RED))
+        sys.exit(2)
+    if not command:
+        print(c("error: chime when needs a command", RED))
+        print(c("       try: chime when make test", DIM))
+        sys.exit(2)
+    sound, say, no_sound, repeat = _read_sound_opts(opts)
+
+    result = run.run(command)
+    line = run.render_line(result)
+    print(line)
+    message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
+    alerts.deliver(
+        "chime",
+        message,
+        sound=sound or alerts.DEFAULT_SOUND,
+        repeat=repeat,
+        do_say=say,
+        silent=no_sound,
+    )
+    sys.exit(result.exit_code)
+
+
 def cmd_version(args: argparse.Namespace) -> None:
     print(f"chime {__version__}")
 
@@ -636,6 +666,24 @@ def _split_flags(argv: list[str]) -> tuple[list[str], list[str]]:
     return pos, flags
 
 
+def _read_sound_opts(flags: list[str]) -> tuple[str | None, bool, bool, int]:
+    """Read the shared alert flags (--sound/--say/--no-sound/--repeat) → tuple.
+
+    Used by both the bare-timer path and `chime when`. Exits 2 on a bad
+    --repeat value. Assumes value flags carry their value (guaranteed by
+    `_split_flags` / `run.split_argv`).
+    """
+    sound = flags[flags.index("--sound") + 1] if "--sound" in flags else None
+    repeat = 3
+    if "--repeat" in flags:
+        try:
+            repeat = int(flags[flags.index("--repeat") + 1])
+        except ValueError:
+            print(c("error: --repeat needs a number", RED))
+            sys.exit(2)
+    return sound, "--say" in flags, "--no-sound" in flags, repeat
+
+
 def _bare_duration(positional: list[str], flags: list[str]) -> None:
     duration = positional[0]
     try:
@@ -644,27 +692,21 @@ def _bare_duration(positional: list[str], flags: list[str]) -> None:
         print(c(f"error: '{duration}' is not a known command or duration", RED))
         print(c("       try: chime help", DIM))
         sys.exit(2)
+    sound, say, no_sound, repeat = _read_sound_opts(flags)
     ns = argparse.Namespace(
-        bg="--bg" in flags,
-        say="--say" in flags,
-        no_sound="--no-sound" in flags,
-        sound=None,
-        repeat=3,
+        bg="--bg" in flags, say=say, no_sound=no_sound, sound=sound, repeat=repeat
     )
-    if "--sound" in flags:
-        ns.sound = flags[flags.index("--sound") + 1]
-    if "--repeat" in flags:
-        try:
-            ns.repeat = int(flags[flags.index("--repeat") + 1])
-        except ValueError:
-            print(c("error: --repeat needs a number", RED))
-            sys.exit(2)
     message = " ".join(positional[1:]) if len(positional) > 1 else None
     run_alarm(seconds, message, ns)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = sys.argv[1:] if argv is None else argv
+    # `when` wraps an opaque command whose own flags must not be parsed by chime,
+    # so it is routed before the global help/version scan and `_split_flags`.
+    if args and args[0] == "when":
+        cmd_when(args[1:])
+        return
     if not args or any(a in ("help", "-h", "--help") for a in args):
         print(USAGE)
         return

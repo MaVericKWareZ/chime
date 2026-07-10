@@ -543,3 +543,62 @@ class TestEffectiveTzChain:
         assert "@ 09:00" in captured["label"]
         for tzname in ("EST", "EDT", "Asia/Kolkata", "America/New_York"):
             assert tzname not in captured["label"]
+
+
+class TestWhen:
+    """`chime when <command>` — Completion notifications (process-monitoring 01)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_alert(self, monkeypatch):
+        self.delivered = []
+        monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: self.delivered.append((a, k)))
+
+    @staticmethod
+    def _py(code):
+        return [sys.executable, "-c", code]
+
+    def test_fires_on_success_and_exits_zero(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", *self._py("import sys; sys.exit(0)")])
+        assert exc.value.code == 0
+        assert len(self.delivered) == 1
+
+    def test_propagates_child_exit_code(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", *self._py("import sys; sys.exit(2)")])
+        assert exc.value.code == 2
+
+    def test_command_not_found_exits_127(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "definitely-not-a-real-command-xyz"])
+        assert exc.value.code == 127
+
+    def test_no_command_errors(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when"])
+        assert exc.value.code == 2
+
+    def test_chime_opts_consumed_command_passed_through(self, monkeypatch):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return cli.run.CompletionResult(" ".join(argv), "passed", 0, 1.0)
+
+        monkeypatch.setattr(cli.run, "run", fake_run)
+        with pytest.raises(SystemExit):
+            cli.main(["when", "--sound", "Glass", "make", "test"])
+        assert captured["argv"] == ["make", "test"]
+        assert self.delivered[0][1]["sound"] == "Glass"
+
+    def test_flags_after_command_go_to_command(self, monkeypatch):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return cli.run.CompletionResult(" ".join(argv), "passed", 0, 1.0)
+
+        monkeypatch.setattr(cli.run, "run", fake_run)
+        with pytest.raises(SystemExit):
+            cli.main(["when", "make", "--verbose"])
+        assert captured["argv"] == ["make", "--verbose"]

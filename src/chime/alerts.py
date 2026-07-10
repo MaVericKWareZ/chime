@@ -206,6 +206,27 @@ def speak(message: str) -> None:
 # ---------- composite ----------
 
 
+def deliver(
+    title: str,
+    message: str,
+    *,
+    sound: str | None,
+    repeat: int,
+    do_say: bool,
+    silent: bool,
+) -> None:
+    """Fan an alert out to the desktop notification, speech, and sound backends.
+
+    The terminal surface (the timer header, the completion line) is rendered by
+    the caller; this is delivery only, shared across every trigger (ADR-0004).
+    """
+    notify(title, message, sound=None if silent else sound)
+    if do_say:
+        speak(message)
+    if not silent:
+        play_sound(sound, repeat=repeat)
+
+
 def trigger(
     message: str | None, sound: str | None, repeat: int, do_say: bool, silent: bool
 ) -> None:
@@ -214,8 +235,11 @@ def trigger(
     print(c(f"⏰  {headline}", BOLD + YELLOW))
     print(c(f"    {datetime.now().strftime('%a %H:%M:%S')}", DIM))
     print()
-    notify("Alarm", message or "Time's up!", sound=None if silent else sound)
-    if do_say:
-        speak(message or "")
-    if not silent:
-        play_sound(sound, repeat=repeat)
+    deliver(
+        "Alarm",
+        message or "Time's up!",
+        sound=sound,
+        repeat=repeat,
+        do_say=do_say,
+        silent=silent,
+    )
