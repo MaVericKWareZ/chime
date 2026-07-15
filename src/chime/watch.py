@@ -10,6 +10,7 @@ line first, per ADR-0004/0005.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from collections.abc import Callable
@@ -24,17 +25,24 @@ class WatchResult:
 
     source: str
     predicate: str
-    outcome: str  # "matched" this slice ("timed_out" → 06, "aborted" → 08)
+    outcome: str  # "matched" | "timed_out" ("aborted" → 08, stream sources)
     polls: int
     elapsed: float
 
 
-def matches(text: str, predicate: str) -> bool:
+def matches(text: str, predicate: str, *, regex: bool = False, ignore_case: bool = False) -> bool:
     """Whether `predicate` fires against `text`.
 
-    This slice: a case-sensitive substring over the whole snapshot output.
-    Slice 06 widens this with `--regex` / `--ignore-case`.
+    Default: a case-sensitive substring over the whole snapshot output. `regex`
+    opts into an `re.search` pattern (`ERROR|FATAL`); `ignore_case` folds case
+    for both the substring and the regex form. New knobs are keyword-only so the
+    poll loop's positional call stays untouched.
     """
+    if regex:
+        flags = re.IGNORECASE if ignore_case else 0
+        return re.search(predicate, text, flags) is not None
+    if ignore_case:
+        return predicate.casefold() in text.casefold()
     return predicate in text
 
 
@@ -43,8 +51,11 @@ def render_line(result: WatchResult) -> str:
 
     Connotation-neutral: `matched` means only that the predicate fired — chime
     does not judge the matched text as good or bad (that's the user's meaning).
+    A `timed_out` is the give-up path: the predicate never appeared in time.
     """
     duration = fmt_duration(result.elapsed)
+    if result.outcome == "timed_out":
+        return f"🔔  `{result.source}` timed out after {duration} — no `{result.predicate}`"
     return f"🔔  `{result.source}` matched `{result.predicate}` ({duration})"
 
 
@@ -63,6 +74,9 @@ def poll(
     predicate: str,
     *,
     interval: float,
+    regex: bool = False,
+    ignore_case: bool = False,
+    timeout: float | None = None,
     snapshot: Callable[[str], str] = _snapshot,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
@@ -71,13 +85,18 @@ def poll(
 
     A **Poll source** is level-state and one-shot in v1: re-run the snapshot,
     match its whole output, and return a `matched` Watch result on the first
-    hit. `snapshot`/`sleep`/`clock` are injectable so tests drive the loop with
-    no real waits (never-kill still holds — a poll source spawns nothing lasting).
+    hit. `timeout` (default none) is the give-up path — once the elapsed time
+    reaches it with no match, return a `timed_out` result instead (the CLI turns
+    that into exit 1). `snapshot`/`sleep`/`clock` are injectable so tests drive
+    the loop with no real waits (never-kill still holds — a poll source spawns
+    nothing lasting).
     """
     start = clock()
     polls = 0
     while True:
         polls += 1
-        if matches(snapshot(command), predicate):
+        if matches(snapshot(command), predicate, regex=regex, ignore_case=ignore_case):
             return WatchResult(command, predicate, "matched", polls, clock() - start)
+        if timeout is not None and clock() - start >= timeout:
+            return WatchResult(command, predicate, "timed_out", polls, clock() - start)
         sleep(interval)

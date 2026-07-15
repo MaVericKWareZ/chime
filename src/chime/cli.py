@@ -614,8 +614,8 @@ def cmd_watch(raw: list[str]) -> None:
     """`chime watch "<command>" <pattern>` — poll a command and alert on a match."""
     pos, flags = _split_named_flags(
         raw,
-        bool_flags={"--say", "--no-sound"},
-        value_flags={"--sound", "--repeat", "--until", "--interval"},
+        bool_flags={"--say", "--no-sound", "--regex", "--ignore-case"},
+        value_flags={"--sound", "--repeat", "--until", "--interval", "--timeout"},
     )
     if not pos:
         print(c("error: chime watch needs a command", RED))
@@ -635,6 +635,9 @@ def cmd_watch(raw: list[str]) -> None:
         print(c("error: chime watch needs a match pattern (--until X or a bare X)", RED))
         sys.exit(2)
 
+    regex = "--regex" in flags
+    ignore_case = "--ignore-case" in flags
+
     interval = 5.0
     if "--interval" in flags:
         raw_interval = flags[flags.index("--interval") + 1]
@@ -643,16 +646,34 @@ def cmd_watch(raw: list[str]) -> None:
         except ValueError:
             print(c(f"error: '{raw_interval}' is not a valid interval", RED))
             sys.exit(2)
+
+    timeout: float | None = None
+    if "--timeout" in flags:
+        raw_timeout = flags[flags.index("--timeout") + 1]
+        try:
+            timeout = parse_duration(raw_timeout)
+        except ValueError:
+            print(c(f"error: '{raw_timeout}' is not a valid timeout", RED))
+            sys.exit(2)
     sound, say, no_sound, repeat = _read_sound_opts(flags)
 
     try:
-        result = watch.poll(command, predicate, interval=interval)
+        result = watch.poll(
+            command,
+            predicate,
+            interval=interval,
+            regex=regex,
+            ignore_case=ignore_case,
+            timeout=timeout,
+        )
     except KeyboardInterrupt:
         # A mid-poll Ctrl-C: mirror `when`/`monitor` — fire nothing, exit 130.
         sys.exit(130)
     line = watch.render_line(result)
     print(line)
     message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
+    # A `timed_out` is still a *fired* alert (the give-up path), so both outcomes
+    # deliver; only the exit code differs — matched → 0, timed_out → 1.
     alerts.deliver(
         "chime",
         message,
@@ -661,7 +682,7 @@ def cmd_watch(raw: list[str]) -> None:
         do_say=say,
         silent=no_sound,
     )
-    sys.exit(0)  # matched → 0
+    sys.exit(0 if result.outcome == "matched" else 1)
 
 
 def cmd_version(args: argparse.Namespace) -> None:
