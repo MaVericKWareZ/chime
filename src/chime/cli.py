@@ -611,28 +611,50 @@ def cmd_monitor(raw: list[str]) -> None:
 
 
 def cmd_watch(raw: list[str]) -> None:
-    """`chime watch "<command>" <pattern>` — poll a command and alert on a match."""
+    """`chime watch <source> <pattern>` — fire when a source's content matches.
+
+    Two source kinds (ADR-0005): a bare command is a **poll** source (re-sampled
+    every `--interval`, one-shot); `--file <path>` is a **stream** source (tails
+    the file, matching each new line, one-shot or `--keep-watching`).
+    """
     pos, flags = _split_named_flags(
         raw,
-        bool_flags={"--say", "--no-sound", "--regex", "--ignore-case"},
-        value_flags={"--sound", "--repeat", "--until", "--interval", "--timeout"},
+        bool_flags={"--say", "--no-sound", "--regex", "--ignore-case", "--keep-watching"},
+        value_flags={"--sound", "--repeat", "--until", "--interval", "--timeout", "--file"},
     )
-    if not pos:
-        print(c("error: chime watch needs a command", RED))
-        print(c('       try: chime watch "curl -s localhost:8080/health" --until UP', DIM))
-        sys.exit(2)
-    command = pos[0]
+    file_path = flags[flags.index("--file") + 1] if "--file" in flags else None
+    keep_watching = "--keep-watching" in flags
+
+    # Resolve the source and the bare-predicate slot. A file source is named by
+    # `--file`, so it has no command positional and the bare predicate is `pos[0]`;
+    # a poll source takes the command as `pos[0]` and the bare predicate as `pos[1]`.
+    if file_path is not None:
+        source = file_path
+        bare_predicate = pos[0] if pos else None
+    else:
+        if not pos:
+            print(c("error: chime watch needs a command or a --file", RED))
+            print(c('       try: chime watch "curl -s localhost:8080/health" --until UP', DIM))
+            sys.exit(2)
+        source = pos[0]
+        bare_predicate = pos[1] if len(pos) > 1 else None
 
     # The predicate is set by `--until <pattern>` or a single bare positional —
     # the two forms are identical; supplying both (or neither) is an error.
     from_flag = flags[flags.index("--until") + 1] if "--until" in flags else None
-    from_pos = pos[1] if len(pos) > 1 else None
-    if from_flag is not None and from_pos is not None:
+    if from_flag is not None and bare_predicate is not None:
         print(c("error: give the match pattern once — --until X or a bare X, not both", RED))
         sys.exit(2)
-    predicate = from_flag if from_flag is not None else from_pos
+    predicate = from_flag if from_flag is not None else bare_predicate
     if predicate is None:
         print(c("error: chime watch needs a match pattern (--until X or a bare X)", RED))
+        sys.exit(2)
+
+    # `--keep-watching` is edge-triggered — it only makes sense on a stream source.
+    # A poll source is level-state and one-shot, so keep-watching it is an error.
+    if keep_watching and file_path is None:
+        print(c("error: --keep-watching needs a stream source (--file)", RED))
+        print(c("       a bare command is a poll source — it fires once", DIM))
         sys.exit(2)
 
     regex = "--regex" in flags
@@ -657,31 +679,50 @@ def cmd_watch(raw: list[str]) -> None:
             sys.exit(2)
     sound, say, no_sound, repeat = _read_sound_opts(flags)
 
-    try:
-        result = watch.poll(
-            command,
-            predicate,
-            interval=interval,
-            regex=regex,
-            ignore_case=ignore_case,
-            timeout=timeout,
+    def fire(result: watch.WatchResult) -> None:
+        """Render + deliver one fired Watch — used per-line for keep-watching and
+        for the terminal result. A `timed_out` is still a *fired* alert (the
+        give-up path), so both outcomes deliver; only the exit code differs."""
+        line = watch.render_line(result)
+        print(line)
+        message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
+        alerts.deliver(
+            "chime",
+            message,
+            sound=sound or alerts.DEFAULT_SOUND,
+            repeat=repeat,
+            do_say=say,
+            silent=no_sound,
         )
+
+    try:
+        if file_path is not None:
+            result = watch.tail_file(
+                source,
+                predicate,
+                interval=interval,
+                regex=regex,
+                ignore_case=ignore_case,
+                timeout=timeout,
+                keep_watching=keep_watching,
+                on_fire=fire,
+            )
+        else:
+            result = watch.poll(
+                source,
+                predicate,
+                interval=interval,
+                regex=regex,
+                ignore_case=ignore_case,
+                timeout=timeout,
+            )
     except KeyboardInterrupt:
-        # A mid-poll Ctrl-C: mirror `when`/`monitor` — fire nothing, exit 130.
+        # A mid-watch Ctrl-C: mirror `when`/`monitor` — fire nothing more, exit 130.
+        # Any keep-watching lines already matched were delivered as they fired.
         sys.exit(130)
-    line = watch.render_line(result)
-    print(line)
-    message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
-    # A `timed_out` is still a *fired* alert (the give-up path), so both outcomes
-    # deliver; only the exit code differs — matched → 0, timed_out → 1.
-    alerts.deliver(
-        "chime",
-        message,
-        sound=sound or alerts.DEFAULT_SOUND,
-        repeat=repeat,
-        do_say=say,
-        silent=no_sound,
-    )
+    # keep-watching already delivered each match via `fire`; the terminal result
+    # here is `timed_out` (→1). One-shot returns `matched` (→0) or `timed_out` (→1).
+    fire(result)
     sys.exit(0 if result.outcome == "matched" else 1)
 
 
