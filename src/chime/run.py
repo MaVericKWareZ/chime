@@ -9,6 +9,7 @@ default rendering, per ADR-0004.
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import sys
@@ -168,8 +169,29 @@ def monitor(stdin_buf, stdout_buf, label: str) -> CompletionResult:
     """
     start = time.monotonic()
     read = getattr(stdin_buf, "read1", stdin_buf.read)
-    while chunk := read(65536):
-        stdout_buf.write(chunk)
-        stdout_buf.flush()
+    try:
+        while chunk := read(65536):
+            stdout_buf.write(chunk)
+            stdout_buf.flush()
+    except BrokenPipeError:
+        # The downstream reader closed early (mid-pipe SIGPIPE). Redirect our
+        # stdout fd to the null device so CPython's shutdown flush is quiet, then
+        # re-raise as the distinct downstream-close signal; `cmd_monitor` maps it
+        # to a quiet exit 141 (no `ended` completion — the producer never EOF'd).
+        _silence_broken_pipe(stdout_buf)
+        raise
     elapsed = time.monotonic() - start
     return CompletionResult(label, "ended", None, elapsed)
+
+
+def _silence_broken_pipe(buf) -> None:
+    """Point `buf`'s fd at the null device so the interpreter's shutdown flush is quiet.
+
+    A no-op when `buf` has no real fd (a fake buffer in tests) — the caller still
+    re-raises `BrokenPipeError` to signal the downstream close.
+    """
+    try:
+        fd = buf.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    os.dup2(os.open(os.devnull, os.O_WRONLY), fd)

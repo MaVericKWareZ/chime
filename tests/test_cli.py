@@ -720,3 +720,44 @@ class TestMonitor:
             cli.main(["monitor", "--only-pass"])
         assert exc.value.code == 2
         assert self.delivered == []
+
+    def test_downstream_close_exits_141_and_fires_nothing(self, monkeypatch, capsys):
+        # The downstream reader went away mid-tee: run.monitor re-raises
+        # BrokenPipeError. cmd_monitor mirrors the Ctrl-C path — no line, no
+        # alert, exit with the SIGPIPE convention (141 = 128 + SIGPIPE).
+        def fake(stdin_buf, stdout_buf, label):
+            raise BrokenPipeError
+
+        monkeypatch.setattr(cli.run, "monitor", fake)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["monitor", "refactor auth"])
+        assert exc.value.code == 141
+        assert self.delivered == []
+        assert capsys.readouterr().out == ""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipe / SIGPIPE semantics")
+def test_monitor_downstream_close_is_quiet_e2e():
+    """`producer | chime monitor | <reader that closes>` exits 141 with no traceback.
+
+    The only check that exercises the real interpreter-shutdown-flush suppression
+    (invisible in-process); gated to POSIX per the PRD's live-signal e2e convention.
+    """
+    producer = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 1_000_000)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    proc = subprocess.Popen(
+        [*CHIME, "monitor"],
+        stdin=producer.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    producer.stdout.close()  # chime holds the read end now
+    proc.stdout.close()  # close the downstream reader → chime's next write is a broken pipe
+    _, err = proc.communicate(timeout=10)
+    producer.wait(timeout=10)
+    assert proc.returncode == 141
+    assert b"Traceback" not in err
+    assert b"BrokenPipeError" not in err

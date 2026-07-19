@@ -1,6 +1,8 @@
 """Unit + thin-e2e checks for the `chime.run` completion-notification module."""
 
+import errno
 import io
+import os
 import sys
 
 import pytest
@@ -164,6 +166,52 @@ def test_monitor_empty_stream_still_ends():
     assert result.outcome == "ended"
     assert result.exit_code is None
     assert result.elapsed >= 0
+
+
+def test_monitor_downstream_close_reraises_after_redirecting_fd(tmp_path):
+    # A downstream reader that went away: write/flush raise BrokenPipeError.
+    # monitor must (a) re-raise BrokenPipeError as the downstream-close signal so
+    # cmd_monitor can map it to exit 141, and (b) redirect our stdout fd to the
+    # null device so CPython's shutdown flush stays quiet. We verify (b) without a
+    # real pipe by pointing fileno() at a real temp fd and confirming a
+    # post-redirect write lands in the null device, not the file.
+    sink = tmp_path / "sink"
+    fd = os.open(sink, os.O_WRONLY | os.O_CREAT)
+    try:
+
+        class DeadReader:
+            def write(self, _chunk):
+                raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+            def fileno(self):
+                return fd
+
+        with pytest.raises(BrokenPipeError):
+            monitor(io.BytesIO(b"payload"), DeadReader(), "label")
+
+        # If the fd was redirected to the null device, this write is discarded;
+        # otherwise it would land in `sink`.
+        os.write(fd, b"should-go-to-devnull")
+    finally:
+        os.close(fd)
+    assert sink.read_bytes() == b""
+
+
+def test_monitor_downstream_close_reraises_without_a_real_fd():
+    # The "no real pipe needed" guard: a buffer whose fileno() is unavailable must
+    # still re-raise BrokenPipeError cleanly (not AttributeError from the redirect).
+    class FdlessDeadReader:
+        def write(self, _chunk):
+            raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+        def flush(self):
+            raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+    with pytest.raises(BrokenPipeError):
+        monitor(io.BytesIO(b"payload"), FdlessDeadReader(), "label")
 
 
 # ---------- run(): thin, portable e2e ----------

@@ -615,6 +615,11 @@ def cmd_monitor(raw: list[str]) -> None:
     except KeyboardInterrupt:
         # A mid-stream Ctrl-C: mirror `when`'s aborted path — fire nothing.
         sys.exit(130)
+    except BrokenPipeError:
+        # The downstream reader closed early: behave like a SIGPIPE-aware filter —
+        # fire nothing, exit 141 (128 + SIGPIPE). run.monitor already redirected
+        # our stdout fd to the null device to keep interpreter shutdown quiet.
+        sys.exit(141)
     line = run.render_line(result)
     print(line)
     message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
