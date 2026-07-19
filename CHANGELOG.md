@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-20
+
 ### Added
 - Process monitoring — three new event-driven verbs that fire Chime's existing alert stack (sound, desktop notification, `--say`, `--repeat`) on a process event rather than a clock.
 - `chime when <command>` — a **Completion notification** wrapper: runs a command as a foreground child with inherited stdio (colors, prompts, and interactivity untouched), times the run, and chimes when it exits with the command, exit code, and elapsed time (`🔔  \`make test\` finished — exit 0 (4m 12s)`). It's a transparent wrapper — the child's exit code is propagated, so it drops into `&&` chains and CI gating unchanged. Chime's own options go before the command (model-A argv grammar); everything from the first bare token on is passed through verbatim, with `--` as an explicit escape. Spawn failures map to shell conventions (127 not-found, 126 not-executable); a foreign signal death maps to `128 + signum` and names the signal on POSIX (`killed by SIGSEGV`), degrading to `exited abnormally (code N)` on Windows.
@@ -53,6 +55,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the 
 - Linux desktop notifications + sound via `notify-send` / `paplay` / `aplay`.
 - Optional spoken alerts via `say` / `spd-say` / `espeak`.
 
-[Unreleased]: https://github.com/MaVericKWareZ/chime/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/MaVericKWareZ/chime/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/MaVericKWareZ/chime/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MaVericKWareZ/chime/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MaVericKWareZ/chime/releases/tag/v0.1.0
