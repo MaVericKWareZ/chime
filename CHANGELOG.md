@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the 
 
 ## [Unreleased]
 
+### Added
+- Process monitoring — three new event-driven verbs that fire Chime's existing alert stack (sound, desktop notification, `--say`, `--repeat`) on a process event rather than a clock.
+- `chime when <command>` — a **Completion notification** wrapper: runs a command as a foreground child with inherited stdio (colors, prompts, and interactivity untouched), times the run, and chimes when it exits with the command, exit code, and elapsed time (`🔔  \`make test\` finished — exit 0 (4m 12s)`). It's a transparent wrapper — the child's exit code is propagated, so it drops into `&&` chains and CI gating unchanged. Chime's own options go before the command (model-A argv grammar); everything from the first bare token on is passed through verbatim, with `--` as an explicit escape. Spawn failures map to shell conventions (127 not-found, 126 not-executable); a foreign signal death maps to `128 + signum` and names the signal on POSIX (`killed by SIGSEGV`), degrading to `exited abnormally (code N)` on Windows.
+- `chime when --only-fail` / `--only-pass` — firing filters that gate whether the alert fires (the exit code is always propagated); specifying both is an error.
+- Ctrl-C (or a SIGTERM aimed at Chime) during `chime when` is forwarded to the child, fires **no** alert (outcome `aborted`), and exits 130; a signal Chime did not send is still a real, chimed completion.
+- `… | chime monitor` — the pipe form of a Completion notification: tees stdin→stdout byte-faithfully and fires when the upstream producer closes (`🔔  stream ended (4m 12s)`). Accepts an optional trailing label for the message, exits 0 on clean EOF, and exits quietly (141) like a SIGPIPE-aware Unix filter when a downstream reader closes early. `--only-fail`/`--only-pass` with `monitor` are an error (a pipe carries no exit status).
+- `chime watch` — fires when a content predicate matches an observed source, distinguishing a **Poll source** (a snapshot command re-run on `--interval`, default 5s — `chime watch "curl -s localhost:8080/health" --until UP`) from a **Stream source** (`--file <path>` tails a log; `--stream "<cmd>"` launches and tees a command). A bare command defaults to a Poll source; source kind is always explicit, never inferred from disk state.
+- `chime watch --file <path>` — tails a file, matching each newly-appended line: seeks to EOF at start (a stale match never fires), waits for the file if it doesn't exist yet then tails from its top, and follows `logrotate`-style rotation/truncation by re-opening from the top of the new file.
+- `chime watch --stream "<cmd>"` — launches a command, tees both stdout and stderr back to their own fds, and matches per line across both. The wrapped process is **never killed** by a match or a timeout — Chime keeps teeing until the child exits on its own (propagating its code) or you Ctrl-C (`aborted`), so watching a live server's logs never takes the server down.
+- `chime watch` predicates — case-sensitive substring by default; `--regex` opts into `re.search`; `--ignore-case` applies to either. A bare trailing positional and `--until <pattern>` set the same predicate. Poll sources match the whole snapshot; Stream sources match per line.
+- `chime watch --timeout <dur>` — fires a `timed_out` alert if nothing matched in time (poll/file sources then exit 1; a `--stream` source keeps teeing). `--keep-watching` fires on every new matching line of a file or `--stream` source (an error on a Poll source). Default is one-shot: fire once on the first match and stop. Exit codes: 0 on match, 1 on timeout, 130 on Ctrl-C.
+- `when`, `monitor`, and `watch` documented in `chime help` and a new **Process monitoring** section of the README.
+
+### Changed
+- `alerts.deliver(title, message, …)` extracted from `alerts.trigger()` so timers, completion notifications, and watches share one delivery path; the existing timer output is byte-identical. No new runtime dependencies — `when`/`monitor`/`watch` are pure stdlib (`subprocess`, `threading`, `os`, `re`, `signal`). Every existing command behaves exactly as before.
+
 ## [0.2.0] - 2026-07-07
 
 ### Added
