@@ -28,6 +28,11 @@ Usage:
   chime pomodoro [work] [brk] [rounds]
                                    Pomodoro cycles (default 25 5 4)
   chime stopwatch                  Count-up timer
+  chime when <command>             Run a command; chime when it exits
+  <producer> | chime monitor       Tee a pipe; chime when the stream ends
+  chime watch <command> --until X  Poll a command; chime when output matches
+  chime watch --file <path>        Tail a file for a match
+  chime watch --stream "<cmd>"     Launch & tee a command; match its output
   chime list                       List background alarms
   chime cancel <id|all>            Cancel a background alarm
   chime sounds [name]              List/preview alarm sounds
@@ -54,6 +59,17 @@ Timezones:
   error with candidates. Set a default with: chime config set timezone <zone>.
   See the README's Timezones section for the full policy.
 
+Process monitoring:
+  chime when runs a command and chimes on exit, propagating its code;
+  --only-fail / --only-pass gate the alert. chime monitor tees a pipe and
+  chimes when it closes. chime watch chimes on a content match: a bare
+  command is a poll source (--interval, default 5s), --file tails a file,
+  --stream launches and tees a command (never killed by a match/timeout).
+  Predicate: a bare word or --until X (substring), plus --regex,
+  --ignore-case; also --timeout and --keep-watching (stream sources only).
+  The alert options above (--sound, --say, --no-sound, --repeat) apply to
+  all three. See the README's Process monitoring section for examples.
+
 Examples:
   chime 10m "tea is ready"
   chime 1h30m
@@ -65,6 +81,9 @@ Examples:
   chime pomodoro
   chime pomodoro 50 10 3
   chime list
+  chime when make test
+  chime watch "curl -s localhost:8080/health" --until UP
+  chime watch --file deploy.log --until Done
 """
 
 SUBCOMMANDS = {
