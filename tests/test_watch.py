@@ -1,11 +1,82 @@
 """Unit + thin-e2e checks for the `chime.watch` poll-source tracer."""
 
+import io
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 from chime import cli
-from chime.watch import WatchResult, matches, poll, render_line, should_reopen, tail_file
+from chime.watch import (
+    WatchResult,
+    _StreamMatcher,
+    _tee_and_match,
+    matches,
+    poll,
+    render_line,
+    should_reopen,
+    stream,
+    tail_file,
+)
+
+
+def _stream_matcher(on_fire, *, predicate="listening", **kw):
+    """A `_StreamMatcher` with a frozen clock so fired results have a stable elapsed."""
+    return _StreamMatcher("srv", predicate, on_fire=on_fire, clock=lambda: 0.0, **kw)
+
+
+class _FakePopen:
+    """A deterministic stand-in for the wrapped child of a `--stream` watch.
+
+    Its pipes are pre-filled StringIO buffers the reader threads drain to EOF, so
+    `stream()` runs with no real subprocess and no real waits. `wait()` returns the
+    canned code, unless `wait_raises` scripts exceptions (a `TimeoutExpired` to
+    drive the give-up path, a `KeyboardInterrupt` to drive abort) for its first
+    calls. It records any kill/terminate/signal so tests can assert never-kill.
+    """
+
+    def __init__(self, *, stdout="", stderr="", returncode=0, wait_raises=None):
+        self.stdout = io.StringIO(stdout)
+        self.stderr = io.StringIO(stderr)
+        self.returncode = returncode
+        self._wait_raises = list(wait_raises or [])
+        self.wait_calls = 0
+        self.killed = False
+        self.terminated = False
+        self.signals = []
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        if self._wait_raises:
+            raise self._wait_raises.pop(0)
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+    def terminate(self):
+        self.terminated = True
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+
+
+def _run_stream(fake, predicate="listening", **kw):
+    """Drive `stream()` against a `_FakePopen`, capturing fires and teed output."""
+    fires = []
+    out, err = io.StringIO(), io.StringIO()
+    result = stream(
+        "srv",
+        predicate,
+        on_fire=fires.append,
+        stdout=out,
+        stderr=err,
+        popen=lambda *a, **k: fake,
+        clock=lambda: 0.0,
+        **kw,
+    )
+    return result, fires, out, err
 
 
 def _stat(size, ino=1, dev=1):
@@ -63,6 +134,20 @@ def _fake_tail_matched(capture):
         return WatchResult(path, predicate, "matched", 1, 1.0)
 
     return fake_tail
+
+
+def _fake_stream(capture, *, outcome="ended", returncode=0):
+    """A `watch.stream` stand-in: records its call and reports a lifecycle result.
+
+    Streams fire content alerts *inline* via `on_fire`, so the terminal result the
+    CLI receives is only `ended` (propagate the child's code) or `aborted` (130).
+    """
+
+    def fake(command, predicate, *, on_fire, **_kw):
+        capture.update(command=command, predicate=predicate, **_kw)
+        return WatchResult(command, predicate, outcome, 0, 1.0, returncode=returncode)
+
+    return fake
 
 
 def test_should_reopen_truncation():
@@ -387,6 +472,190 @@ def test_poll_default_runner_includes_stderr():
     assert result.polls == 1
 
 
+# ---------- stream source (--stream): matcher, tee pump, orchestrator ----------
+
+
+def test_watch_result_returncode_defaults_none_and_carries_child_code():
+    # Poll/file results never set it; a stream result propagates the child's code.
+    assert WatchResult("cmd", "UP", "matched", 1, 1.0).returncode is None
+    assert WatchResult("cmd", "UP", "ended", 0, 1.0, returncode=3).returncode == 3
+
+
+def test_stream_matcher_one_shot_fires_once_then_disarms():
+    # One-shot: fire on the first matching line, then stop matching (but the child
+    # keeps running — the orchestrator keeps teeing). A later match does not re-fire.
+    fires = []
+    m = _stream_matcher(fires.append)
+    m.on_line("listening on 3000")
+    m.on_line("listening again")
+    assert [r.outcome for r in fires] == ["matched"]
+    assert m.matched_ever is True
+    assert m.armed is False
+
+
+def test_stream_matcher_keep_watching_fires_every_matching_line():
+    fires = []
+    m = _stream_matcher(fires.append, keep_watching=True)
+    m.on_line("listening a")
+    m.on_line("nope")
+    m.on_line("listening b")
+    assert [r.outcome for r in fires] == ["matched", "matched"]
+    assert m.armed is True  # continuous: never disarms on a match
+
+
+def test_stream_matcher_ignores_non_matching_lines():
+    fires = []
+    m = _stream_matcher(fires.append)
+    m.on_line("booting")
+    assert fires == []
+    assert m.armed is True
+
+
+def test_stream_matcher_threads_regex_and_ignore_case_to_matches():
+    fires = []
+    m = _stream_matcher(fires.append, predicate="err|warn", regex=True, ignore_case=True)
+    m.on_line("got ERR now")
+    assert [r.outcome for r in fires] == ["matched"]
+
+
+def test_stream_matcher_timeout_fires_once_then_matching_stops():
+    # The give-up path: fire `timed_out`, disarm, and keep teeing. A line that
+    # matches *after* the timeout must not fire (one-shot already gave up).
+    fires = []
+    m = _stream_matcher(fires.append)
+    m.on_timeout(10.0)
+    m.on_line("listening")  # arrives late — ignored
+    assert [r.outcome for r in fires] == ["timed_out"]
+    assert m.armed is False
+
+
+def test_stream_matcher_timeout_after_a_match_is_a_noop():
+    # A one-shot that already matched is disarmed, so a trailing timeout tick
+    # (a race between the deadline and the reader) does not double-fire.
+    fires = []
+    m = _stream_matcher(fires.append)
+    m.on_line("listening")
+    m.on_timeout(10.0)
+    assert [r.outcome for r in fires] == ["matched"]
+
+
+def test_stream_matches_stdout_and_never_kills_child():
+    # The tracer bullet for the orchestrator: a matching stdout line fires, the
+    # child exits on its own (outcome `ended`, its code propagated), and chime
+    # never sends a terminating signal.
+    fake = _FakePopen(stdout="booting\nlistening on 3000\n", returncode=0)
+    result, fires, _out, _err = _run_stream(fake)
+    assert [r.outcome for r in fires] == ["matched"]
+    assert result.outcome == "ended"
+    assert result.returncode == 0
+    assert not fake.killed and not fake.terminated and fake.signals == []
+
+
+def test_stream_matches_stderr_and_tees_both_fds():
+    # Server errors go to stderr — matching must cover it. And both streams are
+    # re-emitted to chime's own corresponding fds (faithful passthrough).
+    fake = _FakePopen(stdout="serving\n", stderr="FATAL boom\n", returncode=1)
+    result, fires, out, err = _run_stream(fake, predicate="FATAL")
+    assert [r.outcome for r in fires] == ["matched"]
+    assert out.getvalue() == "serving\n"
+    assert err.getvalue() == "FATAL boom\n"
+    assert result.returncode == 1  # the child's own code is propagated
+
+
+def test_stream_one_shot_keeps_teeing_after_firing():
+    # One-shot fires once, but later lines are still teed (the child is never cut off).
+    fake = _FakePopen(stdout="listening\nrequest 1\nrequest 2\n", returncode=0)
+    _result, fires, out, _err = _run_stream(fake)
+    assert len(fires) == 1  # fired once
+    assert out.getvalue() == "listening\nrequest 1\nrequest 2\n"  # everything teed
+
+
+def test_stream_keep_watching_fires_every_matching_line():
+    fake = _FakePopen(stdout="ERROR a\nok\nERROR b\n", returncode=0)
+    _result, fires, _out, _err = _run_stream(fake, predicate="ERROR", keep_watching=True)
+    assert [r.outcome for r in fires] == ["matched", "matched"]
+
+
+def test_stream_timeout_fires_and_still_propagates_child_code():
+    # `--timeout` with no match fires `timed_out`, keeps teeing, and the process
+    # still ends on the child's own exit code — the timeout never kills it.
+    fake = _FakePopen(
+        stdout="warming up\n",
+        returncode=7,
+        wait_raises=[subprocess.TimeoutExpired("srv", 0.1)],
+    )
+    result, fires, _out, _err = _run_stream(fake, predicate="never", timeout=0.1)
+    assert [r.outcome for r in fires] == ["timed_out"]
+    assert result.outcome == "ended"
+    assert result.returncode == 7
+    assert not fake.killed and not fake.terminated
+
+
+def test_stream_child_exit_without_match_is_silent_and_propagates_code():
+    fake = _FakePopen(stdout="quiet\n", returncode=3)
+    result, fires, _out, _err = _run_stream(fake, predicate="never")
+    assert fires == []  # a bare child exit is not a content match — no alert
+    assert result.outcome == "ended"
+    assert result.returncode == 3
+
+
+def test_stream_aborted_on_keyboard_interrupt_is_silent_and_never_kills():
+    # A Ctrl-C during the wait surfaces as KeyboardInterrupt: reap the child, no
+    # alert, outcome `aborted`, returncode absent — mapped to exit 130 by the CLI.
+    fake = _FakePopen(stdout="running\n", returncode=0, wait_raises=[KeyboardInterrupt()])
+    result, fires, _out, _err = _run_stream(fake, predicate="never")
+    assert fires == []  # the abort itself fires nothing
+    assert result.outcome == "aborted"
+    assert result.returncode is None
+    assert not fake.killed and not fake.terminated and fake.signals == []
+
+
+def test_stream_e2e_real_child_matches_across_both_streams():
+    # Thin real-subprocess e2e (per the AC): a genuine child prints to stdout and
+    # stderr, exits on its own, and its threaded pipes are matched + teed for real.
+    code = (
+        "import sys, time; print('booting'); print('listening on 3000'); "
+        "print('startup warn', file=sys.stderr); sys.stdout.flush(); "
+        "time.sleep(0.05); sys.exit(0)"
+    )
+    fires = []
+    out, err = io.StringIO(), io.StringIO()
+    result = stream(
+        f'"{sys.executable}" -c "{code}"',
+        "listening",
+        on_fire=fires.append,
+        stdout=out,
+        stderr=err,
+    )
+    assert [r.outcome for r in fires] == ["matched"]
+    assert result.outcome == "ended"
+    assert result.returncode == 0  # the child reached its own exit, was not killed
+    assert "listening on 3000" in out.getvalue()
+    assert "startup warn" in err.getvalue()
+
+
+def test_tee_and_match_tees_verbatim_and_matches_rstripped():
+    # Each complete line is re-emitted to the writer *with* its newline (faithful
+    # passthrough), while the matcher sees the line with the trailing newline stripped.
+    reader = io.StringIO("booting\nlistening\n")
+    writer = io.StringIO()
+    seen = []
+    _tee_and_match(reader, writer, seen.append)
+    assert writer.getvalue() == "booting\nlistening\n"
+    assert seen == ["booting", "listening"]
+
+
+def test_tee_and_match_emits_trailing_partial_line_at_eof():
+    # A final line without a newline (e.g. the child exits mid-line) is still teed
+    # and matched once EOF arrives — it is not swallowed.
+    reader = io.StringIO("done\ntail-no-newline")
+    writer = io.StringIO()
+    seen = []
+    _tee_and_match(reader, writer, seen.append)
+    assert writer.getvalue() == "done\ntail-no-newline"
+    assert seen == ["done", "tail-no-newline"]
+
+
 def test_cli_until_and_bare_positional_are_equivalent(monkeypatch):
     monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: None)
 
@@ -593,3 +862,89 @@ def test_cli_predicate_given_twice_exits_2():
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["watch", "check-health", "UP", "--until", "UP"])
     assert exit_info.value.code == 2
+
+
+def test_cli_stream_routes_to_stream(monkeypatch):
+    monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: None)
+    cap = {}
+    monkeypatch.setattr(cli.watch, "stream", _fake_stream(cap, returncode=0))
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["watch", "--stream", "npm run dev", "--until", "listening"])
+    assert exit_info.value.code == 0
+    assert cap["command"] == "npm run dev"
+    assert cap["predicate"] == "listening"
+
+
+def test_cli_stream_propagates_child_exit_code(monkeypatch):
+    # A stream ends on the child's own exit; the CLI propagates that code, not 0/1.
+    monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: None)
+    monkeypatch.setattr(cli.watch, "stream", _fake_stream({}, returncode=5))
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["watch", "--stream", "flaky", "--until", "up"])
+    assert exit_info.value.code == 5
+
+
+def test_cli_stream_aborted_exits_130(monkeypatch):
+    monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: None)
+    monkeypatch.setattr(cli.watch, "stream", _fake_stream({}, outcome="aborted", returncode=None))
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["watch", "--stream", "sleep 30", "--until", "nope"])
+    assert exit_info.value.code == 130
+
+
+def test_cli_stream_terminal_result_does_not_deliver(monkeypatch):
+    # Content matches fire inline via on_fire; a bare child exit is not an alert,
+    # so the CLI must NOT deliver on the terminal `ended` result.
+    delivered = []
+    monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: delivered.append(k))
+    monkeypatch.setattr(cli.watch, "stream", _fake_stream({}, returncode=0))
+    with pytest.raises(SystemExit):
+        cli.main(["watch", "--stream", "srv", "--until", "up"])
+    assert delivered == []
+
+
+def test_cli_stream_with_interval_exits_2():
+    # `--interval` is poll-only; combining it with a stream source is an error.
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["watch", "--stream", "srv", "--until", "up", "--interval", "2s"])
+    assert exit_info.value.code == 2
+
+
+def test_cli_stream_with_file_exits_2():
+    # Two explicit sources at once is an error.
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["watch", "--stream", "srv", "--file", "x.log", "--until", "up"])
+    assert exit_info.value.code == 2
+
+
+def test_cli_keep_watching_allowed_with_stream(monkeypatch):
+    monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: None)
+    cap = {}
+    monkeypatch.setattr(cli.watch, "stream", _fake_stream(cap, returncode=0))
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["watch", "--stream", "srv", "--until", "ERROR", "--keep-watching"])
+    assert exit_info.value.code == 0
+    assert cap["keep_watching"] is True
+
+
+def test_cli_stream_flags_thread_to_stream(monkeypatch):
+    monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: None)
+    cap = {}
+    monkeypatch.setattr(cli.watch, "stream", _fake_stream(cap, returncode=0))
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                "watch",
+                "--stream",
+                "srv",
+                "--until",
+                "E|F",
+                "--regex",
+                "--ignore-case",
+                "--timeout",
+                "30s",
+            ]
+        )
+    assert cap["regex"] is True
+    assert cap["ignore_case"] is True
+    assert cap["timeout"] == 30.0

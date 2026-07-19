@@ -13,9 +13,12 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import IO
 
 from chime.parsers import fmt_duration
 
@@ -26,9 +29,13 @@ class WatchResult:
 
     source: str
     predicate: str
-    outcome: str  # "matched" | "timed_out" ("aborted" → 08, stream sources)
+    # Content dimension: "matched" | "timed_out" (poll/file terminal; fired inline
+    # for a stream). Stream lifecycle terminal: "ended" (the child exited on its
+    # own — sibling of run.CompletionResult's "ended") | "aborted" (Ctrl-C).
+    outcome: str
     polls: int
     elapsed: float
+    returncode: int | None = None  # a --stream child's own exit code (else None)
 
 
 def matches(text: str, predicate: str, *, regex: bool = False, ignore_case: bool = False) -> bool:
@@ -197,3 +204,171 @@ def tail_file(
             sleep(interval)
     finally:
         f.close()
+
+
+def _tee_and_match(reader: IO[str], writer: IO[str], on_line: Callable[[str], None]) -> None:
+    """Pump `reader` line-by-line: re-emit each line to `writer` and hand it to `on_line`.
+
+    The pipe form of a **Stream source**: every complete line is teed to `writer`
+    verbatim (its trailing newline preserved, so passthrough is faithful) and
+    flushed immediately, then passed to `on_line` with the newline stripped — the
+    same text `matches()` sees for a file source. `readline` blocks until a line
+    or EOF, so a mid-stream partial line waits for its newline; a final line with
+    no newline (the child exited mid-line) is still teed and matched once at EOF.
+    Runs on one thread per pipe — it touches no shared state itself.
+    """
+    for line in iter(reader.readline, ""):
+        writer.write(line)
+        writer.flush()
+        on_line(line.rstrip("\n"))
+
+
+class _StreamMatcher:
+    """The shared, lock-guarded firing state behind a `--stream` watch.
+
+    Both reader threads (one per pipe) feed lines into `on_line`, so the "armed"
+    state and the `on_fire` delivery are serialized by a lock. One-shot disarms
+    after the first match but the child keeps running (never-kill): matching stops
+    while the orchestrator keeps teeing. `--keep-watching` never disarms. A
+    `timed_out` give-up (`on_timeout`) likewise disarms and keeps teeing; once
+    disarmed, a later match cannot fire.
+    """
+
+    def __init__(
+        self,
+        command: str,
+        predicate: str,
+        *,
+        on_fire: Callable[[WatchResult], None],
+        regex: bool = False,
+        ignore_case: bool = False,
+        keep_watching: bool = False,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.command = command
+        self.predicate = predicate
+        self.on_fire = on_fire
+        self.regex = regex
+        self.ignore_case = ignore_case
+        self.keep_watching = keep_watching
+        self.clock = clock
+        self.start = clock()
+        self.armed = True
+        self.matched_ever = False
+        self._lock = threading.Lock()
+
+    def on_line(self, text: str) -> None:
+        """Match one teed line; fire (and, if one-shot, disarm) on a hit."""
+        with self._lock:
+            if not self.armed:
+                return
+            if matches(text, self.predicate, regex=self.regex, ignore_case=self.ignore_case):
+                self.matched_ever = True
+                elapsed = self.clock() - self.start
+                self.on_fire(WatchResult(self.command, self.predicate, "matched", 0, elapsed))
+                if not self.keep_watching:
+                    self.armed = False  # one-shot: stop matching, keep teeing
+
+    def on_timeout(self, elapsed: float) -> None:
+        """Fire the give-up alert once, then disarm — the child is never killed."""
+        with self._lock:
+            if not self.armed:
+                return
+            self.on_fire(WatchResult(self.command, self.predicate, "timed_out", 0, elapsed))
+            self.armed = False
+
+
+def stream(
+    command: str,
+    predicate: str,
+    *,
+    on_fire: Callable[[WatchResult], None],
+    regex: bool = False,
+    ignore_case: bool = False,
+    timeout: float | None = None,
+    keep_watching: bool = False,
+    stdout: IO[str] | None = None,
+    stderr: IO[str] | None = None,
+    popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+    clock: Callable[[], float] = time.monotonic,
+) -> WatchResult:
+    """Launch `command`, tee its stdout+stderr, and fire when a line matches.
+
+    A **command Stream source** (ADR-0005): pipe the child's stdout and stderr,
+    read each with its own thread (one reader thread per pipe — uniform across
+    platforms, avoiding `select`, which does not work on pipes on Windows),
+    re-emit every line to chime's corresponding fd, and match each line across
+    both streams. The child is **never killed** by a match or a timeout — chime
+    keeps teeing until the child exits on its own (return `ended`, propagating its
+    code) or the user Ctrl-Cs (return `aborted`, no alert). Content matches and
+    the give-up `timed_out` fire *inline* through `on_fire`; the returned result
+    carries only the lifecycle outcome and the child's exit code.
+
+    `popen`/`stdout`/`stderr`/`clock` are injectable so tests drive the whole
+    lifecycle against a fake child with pre-filled pipes — no real subprocess.
+    """
+    out = stdout if stdout is not None else sys.stdout
+    err = stderr if stderr is not None else sys.stderr
+    start = clock()
+    proc = popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    matcher = _StreamMatcher(
+        command,
+        predicate,
+        on_fire=on_fire,
+        regex=regex,
+        ignore_case=ignore_case,
+        keep_watching=keep_watching,
+        clock=clock,
+    )
+    readers = [
+        threading.Thread(
+            target=_tee_and_match, args=(proc.stdout, out, matcher.on_line), daemon=True
+        ),
+        threading.Thread(
+            target=_tee_and_match, args=(proc.stderr, err, matcher.on_line), daemon=True
+        ),
+    ]
+    for t in readers:
+        t.start()
+
+    aborted = False
+    returncode: int | None = None
+    try:
+        try:
+            while True:
+                # Only bound the wait while still matching with a live deadline; once a
+                # match or the timeout has disarmed the matcher, block until the child
+                # exits on its own (never-kill).
+                remaining = None
+                if timeout is not None and matcher.armed:
+                    remaining = max(0.0, timeout - (clock() - start))
+                try:
+                    returncode = proc.wait(timeout=remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    matcher.on_timeout(clock() - start)  # fire `timed_out`, keep teeing
+        except KeyboardInterrupt:
+            # Your Ctrl-C: the child shares the foreground process group and already
+            # got the SIGINT (as in `run.run`); we only reap it. Never kill; no alert.
+            aborted = True
+            returncode = proc.wait()
+    finally:
+        for t in readers:
+            t.join()  # readers have hit EOF; safe to close the pipes they drained
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
+    elapsed = clock() - start
+    outcome = "aborted" if aborted else "ended"
+    return WatchResult(
+        command, predicate, outcome, 0, elapsed, returncode=None if aborted else returncode
+    )

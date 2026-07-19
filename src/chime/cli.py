@@ -620,20 +620,42 @@ def cmd_watch(raw: list[str]) -> None:
     pos, flags = _split_named_flags(
         raw,
         bool_flags={"--say", "--no-sound", "--regex", "--ignore-case", "--keep-watching"},
-        value_flags={"--sound", "--repeat", "--until", "--interval", "--timeout", "--file"},
+        value_flags={
+            "--sound",
+            "--repeat",
+            "--until",
+            "--interval",
+            "--timeout",
+            "--file",
+            "--stream",
+        },
     )
     file_path = flags[flags.index("--file") + 1] if "--file" in flags else None
+    stream_cmd = flags[flags.index("--stream") + 1] if "--stream" in flags else None
     keep_watching = "--keep-watching" in flags
 
-    # Resolve the source and the bare-predicate slot. A file source is named by
-    # `--file`, so it has no command positional and the bare predicate is `pos[0]`;
+    # A source is named exactly once. `--file` and `--stream` are both explicit
+    # stream sources; giving both is ambiguous. `--interval` samples a poll source,
+    # so it is meaningless on a stream (which is read continuously, never re-run).
+    if file_path is not None and stream_cmd is not None:
+        print(c("error: choose one source — --file or --stream, not both", RED))
+        sys.exit(2)
+    if stream_cmd is not None and "--interval" in flags:
+        print(c("error: --interval is poll-only; a --stream source is read continuously", RED))
+        sys.exit(2)
+
+    # Resolve the source and the bare-predicate slot. `--file`/`--stream` name the
+    # source, so it has no command positional and the bare predicate is `pos[0]`;
     # a poll source takes the command as `pos[0]` and the bare predicate as `pos[1]`.
-    if file_path is not None:
+    if stream_cmd is not None:
+        source = stream_cmd
+        bare_predicate = pos[0] if pos else None
+    elif file_path is not None:
         source = file_path
         bare_predicate = pos[0] if pos else None
     else:
         if not pos:
-            print(c("error: chime watch needs a command or a --file", RED))
+            print(c("error: chime watch needs a command, --file, or --stream", RED))
             print(c('       try: chime watch "curl -s localhost:8080/health" --until UP', DIM))
             sys.exit(2)
         source = pos[0]
@@ -652,8 +674,8 @@ def cmd_watch(raw: list[str]) -> None:
 
     # `--keep-watching` is edge-triggered — it only makes sense on a stream source.
     # A poll source is level-state and one-shot, so keep-watching it is an error.
-    if keep_watching and file_path is None:
-        print(c("error: --keep-watching needs a stream source (--file)", RED))
+    if keep_watching and file_path is None and stream_cmd is None:
+        print(c("error: --keep-watching needs a stream source (--file or --stream)", RED))
         print(c("       a bare command is a poll source — it fires once", DIM))
         sys.exit(2)
 
@@ -694,6 +716,24 @@ def cmd_watch(raw: list[str]) -> None:
             do_say=say,
             silent=no_sound,
         )
+
+    if stream_cmd is not None:
+        # A --stream source tees the child and fires content matches *inline* via
+        # `fire`; it is never killed by a match/timeout. The terminal result is a
+        # lifecycle event, not an alert — so do NOT `fire` it. Ctrl-C → 130; any
+        # other end propagates the child's own exit code (`stream` reaps its own KI).
+        result = watch.stream(
+            source,
+            predicate,
+            on_fire=fire,
+            regex=regex,
+            ignore_case=ignore_case,
+            timeout=timeout,
+            keep_watching=keep_watching,
+        )
+        if result.outcome == "aborted":
+            sys.exit(130)
+        sys.exit(result.returncode or 0)
 
     try:
         if file_path is not None:
