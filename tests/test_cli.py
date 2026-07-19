@@ -543,3 +543,221 @@ class TestEffectiveTzChain:
         assert "@ 09:00" in captured["label"]
         for tzname in ("EST", "EDT", "Asia/Kolkata", "America/New_York"):
             assert tzname not in captured["label"]
+
+
+class TestWhen:
+    """`chime when <command>` — Completion notifications (process-monitoring 01)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_alert(self, monkeypatch):
+        self.delivered = []
+        monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: self.delivered.append((a, k)))
+
+    @staticmethod
+    def _py(code):
+        return [sys.executable, "-c", code]
+
+    def test_fires_on_success_and_exits_zero(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", *self._py("import sys; sys.exit(0)")])
+        assert exc.value.code == 0
+        assert len(self.delivered) == 1
+
+    def test_propagates_child_exit_code(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", *self._py("import sys; sys.exit(2)")])
+        assert exc.value.code == 2
+
+    def test_command_not_found_exits_127(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "definitely-not-a-real-command-xyz"])
+        assert exc.value.code == 127
+
+    def test_no_command_errors(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when"])
+        assert exc.value.code == 2
+
+    def test_chime_opts_consumed_command_passed_through(self, monkeypatch):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return cli.run.CompletionResult(" ".join(argv), "passed", 0, 1.0)
+
+        monkeypatch.setattr(cli.run, "run", fake_run)
+        with pytest.raises(SystemExit):
+            cli.main(["when", "--sound", "Glass", "make", "test"])
+        assert captured["argv"] == ["make", "test"]
+        assert self.delivered[0][1]["sound"] == "Glass"
+
+    def test_flags_after_command_go_to_command(self, monkeypatch):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return cli.run.CompletionResult(" ".join(argv), "passed", 0, 1.0)
+
+        monkeypatch.setattr(cli.run, "run", fake_run)
+        with pytest.raises(SystemExit):
+            cli.main(["when", "make", "--verbose"])
+        assert captured["argv"] == ["make", "--verbose"]
+
+    def test_aborted_suppresses_alert_and_exits_130(self, monkeypatch):
+        def fake_run(argv, **kwargs):
+            return cli.run.CompletionResult(" ".join(argv), "aborted", 130, 1.0)
+
+        monkeypatch.setattr(cli.run, "run", fake_run)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "sleep", "100"])
+        assert exc.value.code == 130
+        assert self.delivered == []
+
+    # --- firing filters: --only-fail / --only-pass (process-monitoring 03) ---
+
+    def _fake_result(self, monkeypatch, outcome, exit_code):
+        monkeypatch.setattr(
+            cli.run,
+            "run",
+            lambda argv, **k: cli.run.CompletionResult(" ".join(argv), outcome, exit_code, 1.0),
+        )
+
+    def test_only_fail_suppresses_on_pass(self, monkeypatch, capsys):
+        self._fake_result(monkeypatch, "passed", 0)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-fail", "make", "test"])
+        assert exc.value.code == 0  # child code still propagated
+        assert self.delivered == []  # no alert
+        assert capsys.readouterr().out == ""  # no 🔔 line either
+
+    def test_only_fail_fires_on_failure(self, monkeypatch):
+        self._fake_result(monkeypatch, "failed", 2)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-fail", "make", "test"])
+        assert exc.value.code == 2
+        assert len(self.delivered) == 1
+
+    def test_only_pass_fires_on_success(self, monkeypatch):
+        self._fake_result(monkeypatch, "passed", 0)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-pass", "make", "test"])
+        assert exc.value.code == 0
+        assert len(self.delivered) == 1
+
+    def test_only_pass_suppresses_on_failure(self, monkeypatch, capsys):
+        self._fake_result(monkeypatch, "failed", 2)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-pass", "make", "test"])
+        assert exc.value.code == 2  # child code still propagated
+        assert self.delivered == []
+        assert capsys.readouterr().out == ""
+
+    def test_both_only_flags_error(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-fail", "--only-pass", "make", "test"])
+        assert exc.value.code == 2
+        assert self.delivered == []
+
+    def test_aborted_never_fires_even_under_only_pass(self, monkeypatch):
+        self._fake_result(monkeypatch, "aborted", 130)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["when", "--only-pass", "sleep", "100"])
+        assert exc.value.code == 130
+        assert self.delivered == []
+
+
+class TestMonitor:
+    """`… | chime monitor` — pipe-form Completion notifications (process-monitoring 04)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_alert(self, monkeypatch):
+        self.delivered = []
+        monkeypatch.setattr(cli.alerts, "deliver", lambda *a, **k: self.delivered.append((a, k)))
+
+    def _fake_monitor(self, monkeypatch, label_box=None):
+        def fake(stdin_buf, stdout_buf, label):
+            if label_box is not None:
+                label_box["label"] = label
+            return cli.run.CompletionResult(label, "ended", None, 1.0)
+
+        monkeypatch.setattr(cli.run, "monitor", fake)
+
+    def test_fires_on_eof_and_exits_zero(self, monkeypatch, capsys):
+        self._fake_monitor(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["monitor"])
+        assert exc.value.code == 0
+        assert len(self.delivered) == 1
+        assert self.delivered[0][0][1].startswith("stream ended")
+        assert capsys.readouterr().out.startswith("🔔  stream ended")
+
+    def test_label_reaches_the_alert(self, monkeypatch):
+        box = {}
+        self._fake_monitor(monkeypatch, label_box=box)
+        with pytest.raises(SystemExit):
+            cli.main(["monitor", "refactor auth"])
+        assert box["label"] == "refactor auth"
+        assert self.delivered[0][0][1] == "`refactor auth` stream ended (1s)"
+
+    def test_sound_flag_consumed_by_chime(self, monkeypatch):
+        box = {}
+        self._fake_monitor(monkeypatch, label_box=box)
+        with pytest.raises(SystemExit):
+            cli.main(["monitor", "--sound", "Glass", "refactor auth"])
+        assert box["label"] == "refactor auth"  # flag not swallowed into the label
+        assert self.delivered[0][1]["sound"] == "Glass"
+
+    def test_only_fail_errors(self, monkeypatch):
+        self._fake_monitor(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["monitor", "--only-fail"])
+        assert exc.value.code == 2
+        assert self.delivered == []
+
+    def test_only_pass_errors(self, monkeypatch):
+        self._fake_monitor(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["monitor", "--only-pass"])
+        assert exc.value.code == 2
+        assert self.delivered == []
+
+    def test_downstream_close_exits_141_and_fires_nothing(self, monkeypatch, capsys):
+        # The downstream reader went away mid-tee: run.monitor re-raises
+        # BrokenPipeError. cmd_monitor mirrors the Ctrl-C path — no line, no
+        # alert, exit with the SIGPIPE convention (141 = 128 + SIGPIPE).
+        def fake(stdin_buf, stdout_buf, label):
+            raise BrokenPipeError
+
+        monkeypatch.setattr(cli.run, "monitor", fake)
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["monitor", "refactor auth"])
+        assert exc.value.code == 141
+        assert self.delivered == []
+        assert capsys.readouterr().out == ""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipe / SIGPIPE semantics")
+def test_monitor_downstream_close_is_quiet_e2e():
+    """`producer | chime monitor | <reader that closes>` exits 141 with no traceback.
+
+    The only check that exercises the real interpreter-shutdown-flush suppression
+    (invisible in-process); gated to POSIX per the PRD's live-signal e2e convention.
+    """
+    producer = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 1_000_000)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    proc = subprocess.Popen(
+        [*CHIME, "monitor"],
+        stdin=producer.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    producer.stdout.close()  # chime holds the read end now
+    proc.stdout.close()  # close the downstream reader → chime's next write is a broken pipe
+    _, err = proc.communicate(timeout=10)
+    producer.wait(timeout=10)
+    assert proc.returncode == 141
+    assert b"Traceback" not in err
+    assert b"BrokenPipeError" not in err

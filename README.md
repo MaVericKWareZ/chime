@@ -27,6 +27,7 @@ $ chime 10m "tea is ready"
 - Timezone-aware alarms (`at "9am EDT"`, `--tz Asia/Kolkata`) with a default configurable per user
 - Pomodoro mode — configurable work / break / rounds
 - Stopwatch (count-up)
+- Process monitoring — chime when a command finishes (`when` / `monitor`), or when text appears in a command, file, or stream (`watch`)
 - Background alarms (`--bg`) that survive shell exit, with `list` / `cancel`
 - Native desktop notifications + system sounds on macOS, Linux, and Windows
 - Optional spoken alerts (`--say`)
@@ -75,6 +76,11 @@ Any of these puts a `chime` command on your PATH.
 | `chime pomodoro` | 25/5 × 4 rounds (defaults) |
 | `chime pomodoro 50 10 3` | 50m work / 10m break × 3 rounds |
 | `chime stopwatch` | Count-up timer |
+| `chime when make test` | Run a command; chime when it exits |
+| `claude code "…" \| chime monitor "refactor"` | Tee a pipe; chime when it closes |
+| `chime watch "curl -s …/health" --until UP` | Poll a command; chime on a match |
+| `chime watch --file deploy.log --until Done` | Tail a file for a match |
+| `chime watch --stream "npm run dev" --regex listening` | Launch & tee a command; match its output |
 | `chime list` | Show active background alarms |
 | `chime cancel 1234` | Cancel one (by id from `chime list`) |
 | `chime cancel all` | Cancel everything |
@@ -152,6 +158,79 @@ Abbreviations are resolved to their IANA name when you set them (`chime config s
 
 - **POSIX (macOS / Linux):** `$XDG_CONFIG_HOME/chime/config.json` (defaults to `~/.config/chime/config.json`).
 - **Windows:** `%APPDATA%\chime\config.json`.
+
+## Process monitoring
+
+Chime can fire on an *event* instead of the clock — when a command finishes, or when text appears in a command's output, a file, or a stream. These verbs reuse the same alert stack (`--sound`, `--say`, `--no-sound`, `--repeat`) and add no runtime dependencies — they're pure Python standard library.
+
+### Completion notifications — `chime when`
+
+`chime when <command>` runs a command as a foreground child, streams its output through untouched, and fires a **Completion notification** when the process exits:
+
+```bash
+chime when make test                 # chime the moment the suite finishes
+chime when --only-fail make deploy   # only chime on a non-zero exit
+chime when -- --weird-tool …         # -- escapes a command that starts with a dash
+```
+
+Chime parses its own options up to the first bare token; that token and everything after it is the wrapped command, passed through verbatim (so `chime when make test --verbose -j4` sends `--verbose -j4` to `make`, not to Chime). Put Chime's own flags *before* the command.
+
+It's a transparent wrapper — colors, progress bars, and interactive prompts work exactly as if you hadn't wrapped it — and it **propagates the child's exit code**, so `chime when make test && ./deploy.sh` and CI gating behave identically to running the command directly. Spawn failures follow shell conventions (`127` command-not-found, `126` found-but-not-executable); a signal death maps to `128 + signum`.
+
+The default line names the command, exit code, and elapsed time:
+
+```
+🔔  `make test` finished — exit 0 (4m 12s)
+```
+
+`--only-fail` chimes only on a non-zero exit, `--only-pass` only on success; specifying both is an error. Hitting Ctrl-C cancels the command and chimes *nothing* (exit `130`) — you're never alerted about something you just killed. A command that dies of a signal you *didn't* send (an OOM kill, a segfault) is a real, failed completion and does chime.
+
+> **Platform note.** On POSIX the message names the signal (`killed by SIGSEGV`); Windows can't, so it degrades to `exited abnormally (code N)`.
+
+### Pipe form — `chime monitor`
+
+`… | chime monitor [label]` tees a stream through to your terminal byte-for-byte and fires when the upstream producer closes:
+
+```bash
+claude code "refactor the auth module" | chime monitor "refactor auth"
+```
+
+Because a pipe carries no exit status, the line reads `stream ended` (with elapsed) rather than an exit code — Chime won't pretend to know a status it can't see. For the same reason, `--only-fail` / `--only-pass` are errors here.
+
+### Watch — fire on a content match
+
+`chime watch` fires a **Watch** when a content predicate matches an observed source. The source kind is always explicit — never guessed from disk state — and there are two kinds.
+
+A **Poll source** is a snapshot command Chime re-runs on an interval, matching the whole output each run. A bare command is a Poll source — the flagship readiness case:
+
+```bash
+chime watch "curl -s localhost:8080/health" --until UP        # chime when the service is up
+chime watch "kubectl get pods" --until Running --interval 10s
+```
+
+`--interval` sets the cadence (default 5s) and applies only to Poll sources. A Poll source is one-shot only; `--keep-watching` on a poll is an error.
+
+A **Stream source** is read as a line stream, matching each new line once. `--file` tails a file:
+
+```bash
+chime watch --file deploy.log --until Done    # chime when Done is appended
+```
+
+The file watch matches only content appended *after* the watch starts (a stale `Done` from yesterday won't fire instantly), waits for the file to appear if it doesn't exist yet, and survives log rotation/truncation by re-opening. Note the source is named with `--file` — a bare first argument to `watch` is always a Poll *command*, never a file path.
+
+`--stream` launches a command and tees it, matching each line across **both stdout and stderr**:
+
+```bash
+chime watch --stream "npm run dev" --regex "listening on"    # chime when the dev server is up
+```
+
+The wrapped process is **never killed by a match or a timeout** — Chime keeps teeing until the child exits on its own (propagating its code) or you Ctrl-C it. So `--stream`-watching a live server for errors never takes the server down. (`--stream` combined with `--interval`, or with `--file`, is an error — a stream isn't polled, and a watch names one source.)
+
+**Predicates.** A bare trailing argument and `--until <pattern>` mean the same thing. Matching is substring by default (case-sensitive); `--regex` opts into a regular expression (`--regex "ERROR|FATAL"`), and `--ignore-case` applies to either.
+
+**Firing.** A watch is one-shot by default — it fires on the first match and stops. On a Stream source, `--keep-watching` fires on *every* new matching line instead (handy for tailing `app.log` for each `ERROR`).
+
+**Timeout.** `--timeout 10m` chimes a "timed out" alert if nothing matched in time. A poll or file watch then exits (code `1`); a `--stream` watch chimes but keeps teeing (never kills the child). A watch is scriptable — exit `0` on match, `1` on timeout, `130` on Ctrl-C — and Ctrl-C stops it silently.
 
 ## Platform support
 

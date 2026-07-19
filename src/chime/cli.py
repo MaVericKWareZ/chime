@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from chime import __version__, alerts, config, state, tz
+from chime import __version__, alerts, config, run, state, tz, watch
 from chime.parsers import fmt_clock, fmt_duration, parse_duration, parse_time
 from chime.term import BOLD, CYAN, DIM, GREEN, MAGENTA, RED, YELLOW, c
 
@@ -28,6 +28,11 @@ Usage:
   chime pomodoro [work] [brk] [rounds]
                                    Pomodoro cycles (default 25 5 4)
   chime stopwatch                  Count-up timer
+  chime when <command>             Run a command; chime when it exits
+  <producer> | chime monitor       Tee a pipe; chime when the stream ends
+  chime watch <command> --until X  Poll a command; chime when output matches
+  chime watch --file <path>        Tail a file for a match
+  chime watch --stream "<cmd>"     Launch & tee a command; match its output
   chime list                       List background alarms
   chime cancel <id|all>            Cancel a background alarm
   chime sounds [name]              List/preview alarm sounds
@@ -54,6 +59,17 @@ Timezones:
   error with candidates. Set a default with: chime config set timezone <zone>.
   See the README's Timezones section for the full policy.
 
+Process monitoring:
+  chime when runs a command and chimes on exit, propagating its code;
+  --only-fail / --only-pass gate the alert. chime monitor tees a pipe and
+  chimes when it closes. chime watch chimes on a content match: a bare
+  command is a poll source (--interval, default 5s), --file tails a file,
+  --stream launches and tees a command (never killed by a match/timeout).
+  Predicate: a bare word or --until X (substring), plus --regex,
+  --ignore-case; also --timeout and --keep-watching (stream sources only).
+  The alert options above (--sound, --say, --no-sound, --repeat) apply to
+  all three. See the README's Process monitoring section for examples.
+
 Examples:
   chime 10m "tea is ready"
   chime 1h30m
@@ -65,6 +81,9 @@ Examples:
   chime pomodoro
   chime pomodoro 50 10 3
   chime list
+  chime when make test
+  chime watch "curl -s localhost:8080/health" --until UP
+  chime watch --file deploy.log --until Done
 """
 
 SUBCOMMANDS = {
@@ -530,6 +549,247 @@ def cmd_config(args: argparse.Namespace) -> None:
     sys.exit(2)
 
 
+def cmd_when(raw: list[str]) -> None:
+    """`chime when <command>` — run a command and alert when it exits."""
+    try:
+        opts, command = run.split_argv(
+            raw,
+            bool_flags={"--say", "--no-sound", "--only-fail", "--only-pass"},
+            value_flags={"--sound", "--repeat"},
+        )
+    except ValueError as e:
+        print(c(f"error: {e} (use -- to pass flags to the command)", RED))
+        sys.exit(2)
+    if not command:
+        print(c("error: chime when needs a command", RED))
+        print(c("       try: chime when make test", DIM))
+        sys.exit(2)
+    if "--only-fail" in opts and "--only-pass" in opts:
+        print(c("error: --only-fail and --only-pass are mutually exclusive", RED))
+        sys.exit(2)
+    only = "fail" if "--only-fail" in opts else "pass" if "--only-pass" in opts else None
+    sound, say, no_sound, repeat = _read_sound_opts(opts)
+
+    result = run.run(command)
+    if result.outcome == "aborted":
+        # A Chime-caught interrupt (your Ctrl-C): the child was already reaped;
+        # fire no alert and exit 130 (never a Completion notification).
+        sys.exit(130)
+    if not run.should_fire(result.outcome, only):
+        # A firing filter (--only-fail/--only-pass) suppressed this outcome:
+        # stay fully silent (no line, no alert) but still propagate the code.
+        sys.exit(result.exit_code)
+    line = run.render_line(result)
+    print(line)
+    message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
+    alerts.deliver(
+        "chime",
+        message,
+        sound=sound or alerts.DEFAULT_SOUND,
+        repeat=repeat,
+        do_say=say,
+        silent=no_sound,
+    )
+    sys.exit(result.exit_code)
+
+
+def cmd_monitor(raw: list[str]) -> None:
+    """`… | chime monitor [label]` — tee a stream and alert when the pipe closes."""
+    if "--only-fail" in raw or "--only-pass" in raw:
+        # A pipe carries no exit status, so there is nothing for the firing
+        # filters to test — reject rather than silently ignore them.
+        print(c("error: --only-fail/--only-pass need an exit code; a pipe has none", RED))
+        sys.exit(2)
+    try:
+        opts, rest = run.split_argv(
+            raw, bool_flags={"--say", "--no-sound"}, value_flags={"--sound", "--repeat"}
+        )
+    except ValueError as e:
+        print(c(f"error: {e} (use -- to pass flags to the command)", RED))
+        sys.exit(2)
+    label = " ".join(rest)
+    sound, say, no_sound, repeat = _read_sound_opts(opts)
+
+    try:
+        result = run.monitor(sys.stdin.buffer, sys.stdout.buffer, label)
+    except KeyboardInterrupt:
+        # A mid-stream Ctrl-C: mirror `when`'s aborted path — fire nothing.
+        sys.exit(130)
+    except BrokenPipeError:
+        # The downstream reader closed early: behave like a SIGPIPE-aware filter —
+        # fire nothing, exit 141 (128 + SIGPIPE). run.monitor already redirected
+        # our stdout fd to the null device to keep interpreter shutdown quiet.
+        sys.exit(141)
+    line = run.render_line(result)
+    print(line)
+    message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
+    alerts.deliver(
+        "chime",
+        message,
+        sound=sound or alerts.DEFAULT_SOUND,
+        repeat=repeat,
+        do_say=say,
+        silent=no_sound,
+    )
+    sys.exit(0)
+
+
+def cmd_watch(raw: list[str]) -> None:
+    """`chime watch <source> <pattern>` — fire when a source's content matches.
+
+    Two source kinds (ADR-0005): a bare command is a **poll** source (re-sampled
+    every `--interval`, one-shot); `--file <path>` is a **stream** source (tails
+    the file, matching each new line, one-shot or `--keep-watching`).
+    """
+    pos, flags = _split_named_flags(
+        raw,
+        bool_flags={"--say", "--no-sound", "--regex", "--ignore-case", "--keep-watching"},
+        value_flags={
+            "--sound",
+            "--repeat",
+            "--until",
+            "--interval",
+            "--timeout",
+            "--file",
+            "--stream",
+        },
+    )
+    file_path = flags[flags.index("--file") + 1] if "--file" in flags else None
+    stream_cmd = flags[flags.index("--stream") + 1] if "--stream" in flags else None
+    keep_watching = "--keep-watching" in flags
+
+    # A source is named exactly once. `--file` and `--stream` are both explicit
+    # stream sources; giving both is ambiguous. `--interval` samples a poll source,
+    # so it is meaningless on a stream (which is read continuously, never re-run).
+    if file_path is not None and stream_cmd is not None:
+        print(c("error: choose one source — --file or --stream, not both", RED))
+        sys.exit(2)
+    if stream_cmd is not None and "--interval" in flags:
+        print(c("error: --interval is poll-only; a --stream source is read continuously", RED))
+        sys.exit(2)
+
+    # Resolve the source and the bare-predicate slot. `--file`/`--stream` name the
+    # source, so it has no command positional and the bare predicate is `pos[0]`;
+    # a poll source takes the command as `pos[0]` and the bare predicate as `pos[1]`.
+    if stream_cmd is not None:
+        source = stream_cmd
+        bare_predicate = pos[0] if pos else None
+    elif file_path is not None:
+        source = file_path
+        bare_predicate = pos[0] if pos else None
+    else:
+        if not pos:
+            print(c("error: chime watch needs a command, --file, or --stream", RED))
+            print(c('       try: chime watch "curl -s localhost:8080/health" --until UP', DIM))
+            sys.exit(2)
+        source = pos[0]
+        bare_predicate = pos[1] if len(pos) > 1 else None
+
+    # The predicate is set by `--until <pattern>` or a single bare positional —
+    # the two forms are identical; supplying both (or neither) is an error.
+    from_flag = flags[flags.index("--until") + 1] if "--until" in flags else None
+    if from_flag is not None and bare_predicate is not None:
+        print(c("error: give the match pattern once — --until X or a bare X, not both", RED))
+        sys.exit(2)
+    predicate = from_flag if from_flag is not None else bare_predicate
+    if predicate is None:
+        print(c("error: chime watch needs a match pattern (--until X or a bare X)", RED))
+        sys.exit(2)
+
+    # `--keep-watching` is edge-triggered — it only makes sense on a stream source.
+    # A poll source is level-state and one-shot, so keep-watching it is an error.
+    if keep_watching and file_path is None and stream_cmd is None:
+        print(c("error: --keep-watching needs a stream source (--file or --stream)", RED))
+        print(c("       a bare command is a poll source — it fires once", DIM))
+        sys.exit(2)
+
+    regex = "--regex" in flags
+    ignore_case = "--ignore-case" in flags
+
+    interval = 5.0
+    if "--interval" in flags:
+        raw_interval = flags[flags.index("--interval") + 1]
+        try:
+            interval = parse_duration(raw_interval)
+        except ValueError:
+            print(c(f"error: '{raw_interval}' is not a valid interval", RED))
+            sys.exit(2)
+
+    timeout: float | None = None
+    if "--timeout" in flags:
+        raw_timeout = flags[flags.index("--timeout") + 1]
+        try:
+            timeout = parse_duration(raw_timeout)
+        except ValueError:
+            print(c(f"error: '{raw_timeout}' is not a valid timeout", RED))
+            sys.exit(2)
+    sound, say, no_sound, repeat = _read_sound_opts(flags)
+
+    def fire(result: watch.WatchResult) -> None:
+        """Render + deliver one fired Watch — used per-line for keep-watching and
+        for the terminal result. A `timed_out` is still a *fired* alert (the
+        give-up path), so both outcomes deliver; only the exit code differs."""
+        line = watch.render_line(result)
+        print(line)
+        message = line.split("  ", 1)[1]  # drop the 🔔 prefix for the notification body
+        alerts.deliver(
+            "chime",
+            message,
+            sound=sound or alerts.DEFAULT_SOUND,
+            repeat=repeat,
+            do_say=say,
+            silent=no_sound,
+        )
+
+    if stream_cmd is not None:
+        # A --stream source tees the child and fires content matches *inline* via
+        # `fire`; it is never killed by a match/timeout. The terminal result is a
+        # lifecycle event, not an alert — so do NOT `fire` it. Ctrl-C → 130; any
+        # other end propagates the child's own exit code (`stream` reaps its own KI).
+        result = watch.stream(
+            source,
+            predicate,
+            on_fire=fire,
+            regex=regex,
+            ignore_case=ignore_case,
+            timeout=timeout,
+            keep_watching=keep_watching,
+        )
+        if result.outcome == "aborted":
+            sys.exit(130)
+        sys.exit(result.returncode or 0)
+
+    try:
+        if file_path is not None:
+            result = watch.tail_file(
+                source,
+                predicate,
+                interval=interval,
+                regex=regex,
+                ignore_case=ignore_case,
+                timeout=timeout,
+                keep_watching=keep_watching,
+                on_fire=fire,
+            )
+        else:
+            result = watch.poll(
+                source,
+                predicate,
+                interval=interval,
+                regex=regex,
+                ignore_case=ignore_case,
+                timeout=timeout,
+            )
+    except KeyboardInterrupt:
+        # A mid-watch Ctrl-C: mirror `when`/`monitor` — fire nothing more, exit 130.
+        # Any keep-watching lines already matched were delivered as they fired.
+        sys.exit(130)
+    # keep-watching already delivered each match via `fire`; the terminal result
+    # here is `timed_out` (→1). One-shot returns `matched` (→0) or `timed_out` (→1).
+    fire(result)
+    sys.exit(0 if result.outcome == "matched" else 1)
+
+
 def cmd_version(args: argparse.Namespace) -> None:
     print(f"chime {__version__}")
 
@@ -636,6 +896,58 @@ def _split_flags(argv: list[str]) -> tuple[list[str], list[str]]:
     return pos, flags
 
 
+def _split_named_flags(
+    argv: list[str], *, bool_flags: set[str], value_flags: set[str]
+) -> tuple[list[str], list[str]]:
+    """Flags-anywhere split of `argv` into (positional, flags) for a given grammar.
+
+    Like `_split_flags` but parameterized by the flag sets, so `chime watch` can
+    carry its own options (`--until`, `--interval`) without polluting the global
+    timer grammar. Unlike `run.split_argv`, positionals do not start an opaque
+    tail — flags may follow the command (`watch "curl …" --until UP`). Exits 2 on
+    an unknown option or a value flag missing its value.
+    """
+    pos: list[str] = []
+    flags: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in bool_flags:
+            flags.append(a)
+            i += 1
+        elif a in value_flags:
+            if i + 1 >= len(argv):
+                print(c(f"error: {a} needs a value", RED))
+                sys.exit(2)
+            flags.extend([a, argv[i + 1]])
+            i += 2
+        elif a.startswith("--"):
+            print(c(f"error: unknown option {a}", RED))
+            sys.exit(2)
+        else:
+            pos.append(a)
+            i += 1
+    return pos, flags
+
+
+def _read_sound_opts(flags: list[str]) -> tuple[str | None, bool, bool, int]:
+    """Read the shared alert flags (--sound/--say/--no-sound/--repeat) → tuple.
+
+    Used by both the bare-timer path and `chime when`. Exits 2 on a bad
+    --repeat value. Assumes value flags carry their value (guaranteed by
+    `_split_flags` / `run.split_argv`).
+    """
+    sound = flags[flags.index("--sound") + 1] if "--sound" in flags else None
+    repeat = 3
+    if "--repeat" in flags:
+        try:
+            repeat = int(flags[flags.index("--repeat") + 1])
+        except ValueError:
+            print(c("error: --repeat needs a number", RED))
+            sys.exit(2)
+    return sound, "--say" in flags, "--no-sound" in flags, repeat
+
+
 def _bare_duration(positional: list[str], flags: list[str]) -> None:
     duration = positional[0]
     try:
@@ -644,27 +956,23 @@ def _bare_duration(positional: list[str], flags: list[str]) -> None:
         print(c(f"error: '{duration}' is not a known command or duration", RED))
         print(c("       try: chime help", DIM))
         sys.exit(2)
+    sound, say, no_sound, repeat = _read_sound_opts(flags)
     ns = argparse.Namespace(
-        bg="--bg" in flags,
-        say="--say" in flags,
-        no_sound="--no-sound" in flags,
-        sound=None,
-        repeat=3,
+        bg="--bg" in flags, say=say, no_sound=no_sound, sound=sound, repeat=repeat
     )
-    if "--sound" in flags:
-        ns.sound = flags[flags.index("--sound") + 1]
-    if "--repeat" in flags:
-        try:
-            ns.repeat = int(flags[flags.index("--repeat") + 1])
-        except ValueError:
-            print(c("error: --repeat needs a number", RED))
-            sys.exit(2)
     message = " ".join(positional[1:]) if len(positional) > 1 else None
     run_alarm(seconds, message, ns)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = sys.argv[1:] if argv is None else argv
+    # The process-monitoring subcommands carry their own argv grammar (opaque
+    # wrapped commands, or flags like --until/--interval) that the global
+    # help/version scan and `_split_flags` would mangle, so they route first.
+    monitoring = {"when": cmd_when, "monitor": cmd_monitor, "watch": cmd_watch}
+    if args and args[0] in monitoring:
+        monitoring[args[0]](args[1:])
+        return
     if not args or any(a in ("help", "-h", "--help") for a in args):
         print(USAGE)
         return
