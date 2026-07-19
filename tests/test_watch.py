@@ -234,6 +234,12 @@ def test_tail_file_follows_truncation(tmp_path):
     assert result.outcome == "matched"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX inode-swap rotation: Windows forbids unlinking a file the tailer holds "
+    "open (open() grants no FILE_SHARE_DELETE). should_reopen's rotation branch is covered "
+    "cross-platform by test_should_reopen_rotation, and the reopen path by the truncation e2e.",
+)
 def test_tail_file_follows_rotation_new_inode(tmp_path):
     log = tmp_path / "svc.log"
     log.write_text("old and long enough\n")  # present at start → seek to EOF
